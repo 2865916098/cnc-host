@@ -166,8 +166,18 @@ fun SimpleMonitorScreen(
         // ===== 操作 =====
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedButton(
-                onClick = { viewModel.requestStop() },
+                onClick = { viewModel.pause() },
                 enabled = run.running,
+                modifier = Modifier.height(52.dp)
+            ) { Text("暂停") }
+            OutlinedButton(
+                onClick = { viewModel.resume() },
+                enabled = run.phase == RunPhase.PAUSED,
+                modifier = Modifier.height(52.dp)
+            ) { Text("继续") }
+            OutlinedButton(
+                onClick = { viewModel.requestStop() },
+                enabled = run.running || run.phase == RunPhase.PAUSED,
                 modifier = Modifier.height(52.dp)
             ) { Text("受控停止") }
             OutlinedButton(
@@ -177,7 +187,7 @@ fun SimpleMonitorScreen(
             ) { Text("急停复位") }
             OutlinedButton(
                 onClick = { viewModel.clearResult() },
-                enabled = !run.running,
+                enabled = !run.running && run.phase != RunPhase.PAUSED,
                 modifier = Modifier.height(52.dp)
             ) { Text("清除结果") }
             OutlinedButton(onClick = onOpenPreview, modifier = Modifier.height(52.dp)) {
@@ -281,6 +291,7 @@ private fun PhaseBadge(phase: RunPhase) {
     val label = when (phase) {
         RunPhase.IDLE -> "就绪"
         RunPhase.RUNNING -> "加工中"
+        RunPhase.PAUSED -> "已暂停"
         RunPhase.COMPLETED -> "已完成"
         RunPhase.FAILED -> "失败"
         RunPhase.STOPPED -> "已停止"
@@ -298,6 +309,7 @@ private fun PhaseBadge(phase: RunPhase) {
 
 private fun phaseColor(phase: RunPhase): Color = when (phase) {
     RunPhase.RUNNING -> CncColors.Warning
+    RunPhase.PAUSED -> CncColors.Info
     RunPhase.COMPLETED -> CncColors.Success
     RunPhase.FAILED, RunPhase.ESTOPPED -> CncColors.Danger
     RunPhase.STOPPED -> CncColors.Info

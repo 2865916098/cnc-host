@@ -121,7 +121,12 @@ data class DrawingConfig(
      * DXF 原文。管理后台可直接粘贴文本，或上传 .dxf 文件。
      * 客户端拉取后存入 Room，用于 CAM 生成。
      */
-    val dxfContent: String = ""
+    val dxfContent: String = "",
+    /**
+     * 关联的工艺方案 ID。客户端简易模式据此读取毛坯尺寸与切削参数。
+     * 空串表示未关联，客户端回退到默认参数。
+     */
+    val planId: String = ""
 )
 
 @Serializable

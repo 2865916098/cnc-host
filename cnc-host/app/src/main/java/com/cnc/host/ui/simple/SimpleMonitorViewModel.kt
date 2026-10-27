@@ -67,6 +67,10 @@ class SimpleMonitorViewModel(application: Application) : AndroidViewModel(applic
 
     fun requestStop() = SimpleRunController.requestStop()
 
+    fun pause() = SimpleRunController.pause()
+
+    fun resume() = SimpleRunController.resume(getApplication())
+
     fun emergencyStop() = SimpleRunController.emergencyStop()
 
     fun resetEstop() = SimpleRunController.resetEstop()

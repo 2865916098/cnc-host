@@ -87,11 +87,12 @@ fun SimplePreviewScreen(
             ui.error != null -> Centered("⚠ ${ui.error}")
             ui.toolpath == null -> Centered("请先在「任务」页选择一个加工任务")
             else -> {
-                if (run.phase == RunPhase.RUNNING) {
-                    Banner(
-                        "作业执行中：${run.taskName}  ${(run.progress * 100).toInt()}%",
-                        CncColors.Warning
-                    )
+                if (run.phase == RunPhase.RUNNING || run.phase == RunPhase.PAUSED) {
+                    val bannerText = if (run.phase == RunPhase.PAUSED)
+                        "作业已暂停：${run.taskName}  ${(run.progress * 100).toInt()}%"
+                    else
+                        "作业执行中：${run.taskName}  ${(run.progress * 100).toInt()}%"
+                    Banner(bannerText, if (run.phase == RunPhase.PAUSED) CncColors.Info else CncColors.Warning)
                     Spacer(Modifier.height(10.dp))
                     Button(onClick = onOpenMonitor) { Text("查看运行监控") }
                     Spacer(Modifier.height(10.dp))
@@ -108,8 +109,10 @@ fun SimplePreviewScreen(
                     Text("加工概要", style = CncTypography.titleMedium, color = CncColors.TextPrimary, fontWeight = FontWeight.Bold)
                     Spacer(Modifier.height(10.dp))
                     InfoRow("刀路来源", ui.drawingName)
+                    InfoRow("工艺方案", ui.planName ?: "未关联（默认参数）", if (ui.planName != null) CncColors.TextPrimary else CncColors.Warning)
                     InfoRow("图纸校正", ui.correctionSummary ?: "未设置")
                     InfoRow("毛坯", ui.stockNote)
+                    InfoRow("主轴转速", "${ui.spindleRpm} rpm")
                     InfoRow("刀路段数", "${ui.toolpath?.segments?.size ?: 0}")
                     InfoRow("G-code 行数", "${ui.gcode?.lines?.size ?: 0}")
                     InfoRow(
@@ -193,7 +196,7 @@ fun SimplePreviewScreen(
                         onClick = {
                             if (viewModel.start()) onOpenMonitor()
                         },
-                        enabled = ui.ready && ui.confirmClamp && !run.running,
+                        enabled = ui.ready && ui.confirmClamp && !run.running && run.phase != RunPhase.PAUSED,
                         modifier = Modifier.height(56.dp),
                         colors = ButtonDefaults.buttonColors(
                             containerColor = CncColors.Success,

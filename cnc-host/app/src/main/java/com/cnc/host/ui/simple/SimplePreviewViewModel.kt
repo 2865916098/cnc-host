@@ -12,6 +12,8 @@ import com.cnc.gcode.post.PostOptions
 import com.cnc.gcode.post.fanuc.Fanuc0iPostProcessor
 import com.cnc.host.persistence.DrawingCorrectionEntity
 import com.cnc.host.persistence.DrawingEntity
+import com.cnc.host.persistence.ProcessPlanEntity
+import com.cnc.host.persistence.ProcessStepEntity
 import com.cnc.host.persistence.cncDb
 import com.cnc.host.simple.SimpleRunController
 import com.cnc.host.simple.SimpleTaskSession
@@ -37,20 +39,28 @@ data class SimplePreviewUiState(
     val ready: Boolean = false,
     val confirmClamp: Boolean = false,
     val started: Boolean = false,
-    /** 毛坯参数目前为默认值，需在服务端工艺方案完善后接入。 */
-    val stockNote: String = "毛坯 180×60 mm（默认值）"
+    /** 工艺方案名称（来自服务端）；null 表示未关联方案，使用默认参数。 */
+    val planName: String? = null,
+    /** 毛坯尺寸说明，已从工艺方案读取。 */
+    val stockNote: String = "毛坯（默认值）",
+    /** 主轴转速，来自工艺步骤；下发时传给执行器。 */
+    val spindleRpm: Int = 1200
 )
 
 /**
  * 预览与下发。
  *
- * 加载当前任务的 DXF 原文 → 套用图纸校正 → 生成刀路与 G-code。
- * 下发动作交给 SimpleRunController（页面切换后继续执行）。
+ * 加载当前任务的 DXF 原文 → 套用图纸校正 → 读取关联工艺方案的毛坯与切削参数
+ * → 生成刀路与 G-code。下发动作交给 SimpleRunController（页面切换后继续执行）。
+ *
+ * 若图纸未关联工艺方案（planId 为空），回退到默认参数并在 stockNote 中标注。
  */
 class SimplePreviewViewModel(application: Application) : AndroidViewModel(application) {
 
     private val drawingDao = application.cncDb().drawingDao()
     private val correctionDao = application.cncDb().drawingCorrectionDao()
+    private val processPlanDao = application.cncDb().processPlanDao()
+    private val processStepDao = application.cncDb().processStepDao()
 
     private val _ui = MutableStateFlow(SimplePreviewUiState())
     val ui: StateFlow<SimplePreviewUiState> = _ui.asStateFlow()
@@ -87,6 +97,14 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
             val transform = correction?.toTransform() ?: Transform2D.IDENTITY
             val summary = correction?.summarize()
 
+            // 读取关联工艺方案：优先使用服务端下发的毛坯尺寸与切削参数
+            val plan = drawing.planId.takeIf { it.isNotBlank() }?.let { processPlanDao.get(it) }
+            val steps = plan?.let { processStepDao.getByPlan(it.id) }.orEmpty()
+            val primaryStep = steps.firstOrNull { it.enabled } ?: steps.firstOrNull()
+
+            val (step, stockDiameter, stockLength, planName) = resolveProcessParams(plan, primaryStep)
+            val stockNote = buildStockNote(plan, stockDiameter, stockLength)
+
             val parsed = DxfParser.parseText(drawing.dxfContent)
             val base = parsed.toGeometryModel("simple-${drawing.id}")
             val geometry = GeometryTransform.apply(base, transform)
@@ -96,20 +114,12 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
                 return
             }
 
-            val step = ProcessStep(
-                id = "simple-step", type = ProcessType.ROUGH_TURNING, toolId = "T1",
-                cuttingSpeedMmPerMin = 150.0, spindleRpm = 1200, feedMmPerRev = 0.2,
-                depthOfCutMm = 5.0, finishAllowanceMm = 1.0,
-                approachDistanceMm = 10.0, retractDistanceMm = 10.0,
-                safetyDistanceMm = 10.0, valid = true
-            )
-            // 与 CAM 页一致：毛坯尺寸暂为默认值，后续由服务端工艺方案提供
             val toolpath = CamEngine.generate(
                 contour = contours.first(),
                 step = step,
-                stockDiameter = 180.0,
-                stockLength = 60.0,
-                processPlanId = drawing.id,
+                stockDiameter = stockDiameter,
+                stockLength = stockLength,
+                processPlanId = plan?.id ?: drawing.id,
                 toolNumber = 1
             )
             val gcode = Fanuc0iPostProcessor().generate(toolpath, PostOptions(lineNumberStep = 5))
@@ -126,7 +136,10 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
                 warnings = toolpath.validation.messages,
                 ready = ready,
                 confirmClamp = _ui.value.confirmClamp,
-                started = SimpleRunController.state.value.running
+                started = SimpleRunController.state.value.running,
+                planName = planName,
+                stockNote = stockNote,
+                spindleRpm = step.spindleRpm
             )
         } catch (e: Exception) {
             _ui.value = _ui.value.copy(
@@ -134,6 +147,25 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
                 error = e.message ?: "刀路生成失败"
             )
         }
+    }
+
+    /**
+     * 解析工艺参数：优先使用服务端工艺方案，缺省时回退到默认值。
+     * 返回 (ProcessStep, stockDiameter, stockLength, planName?)。
+     */
+    private fun resolveProcessParams(
+        plan: ProcessPlanEntity?,
+        step: ProcessStepEntity?
+    ): ProcessParams {
+        val stockDiameter = plan?.stockDiameterMm?.takeIf { it > 0.0 } ?: DEFAULT_STOCK_DIAMETER
+        val stockLength = plan?.stockLengthMm?.takeIf { it > 0.0 } ?: DEFAULT_STOCK_LENGTH
+        val processStep = if (step != null) step.toModel() else defaultStep()
+        return ProcessParams(processStep, stockDiameter, stockLength, plan?.name)
+    }
+
+    private fun buildStockNote(plan: ProcessPlanEntity?, diameter: Double, length: Double): String {
+        val base = "毛坯 ${"%.0f".format(diameter)}×${"%.0f".format(length)} mm"
+        return if (plan != null) "$base（方案：${plan.name}）" else "$base（未关联工艺方案，使用默认值）"
     }
 
     fun setConfirmClamp(value: Boolean) {
@@ -150,7 +182,8 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
             context = getApplication(),
             taskName = ui.drawingName,
             drawingId = ui.drawingId,
-            toolpath = toolpath
+            toolpath = toolpath,
+            spindleRpm = ui.spindleRpm
         )
         _ui.value = _ui.value.copy(started = true)
         return true
@@ -159,6 +192,29 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
     fun emergencyStop() = SimpleRunController.emergencyStop()
 
     fun resetRun() = SimpleRunController.reset()
+
+    private fun ProcessStepEntity.toModel(): ProcessStep = ProcessStep(
+        id = id,
+        type = runCatching { ProcessType.valueOf(type) }.getOrDefault(ProcessType.ROUGH_TURNING),
+        toolId = toolId,
+        cuttingSpeedMmPerMin = cuttingSpeedMmPerMin,
+        spindleRpm = spindleRpm,
+        feedMmPerRev = feedMmPerRev,
+        depthOfCutMm = depthOfCutMm,
+        finishAllowanceMm = finishAllowanceMm,
+        approachDistanceMm = approachDistanceMm,
+        retractDistanceMm = retractDistanceMm,
+        safetyDistanceMm = safetyDistanceMm,
+        valid = true
+    )
+
+    private fun defaultStep(): ProcessStep = ProcessStep(
+        id = "simple-step", type = ProcessType.ROUGH_TURNING, toolId = "T1",
+        cuttingSpeedMmPerMin = 150.0, spindleRpm = DEFAULT_SPINDLE_RPM, feedMmPerRev = 0.2,
+        depthOfCutMm = 5.0, finishAllowanceMm = 1.0,
+        approachDistanceMm = 10.0, retractDistanceMm = 10.0,
+        safetyDistanceMm = 10.0, valid = true
+    )
 
     private fun DrawingCorrectionEntity.toTransform(): Transform2D = Transform2D(
         scale = if (scale > 0.0) scale else 1.0,
@@ -178,5 +234,18 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
         }
         return "缩放 ${"%.3f".format(scale)}x · 偏移 (${"%.2f".format(offsetX)}, " +
             "${"%.2f".format(offsetY)}) · 旋转 ${"%.1f".format(rotationDeg)}° · $mirror"
+    }
+
+    private data class ProcessParams(
+        val step: ProcessStep,
+        val stockDiameter: Double,
+        val stockLength: Double,
+        val planName: String?
+    )
+
+    companion object {
+        private const val DEFAULT_STOCK_DIAMETER = 180.0
+        private const val DEFAULT_STOCK_LENGTH = 60.0
+        private const val DEFAULT_SPINDLE_RPM = 1200
     }
 }

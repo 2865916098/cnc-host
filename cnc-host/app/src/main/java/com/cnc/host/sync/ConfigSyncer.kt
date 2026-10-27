@@ -116,7 +116,7 @@ object ConfigSyncer {
                     DrawingEntity(
                         id = d.id, filename = d.filename, layers = d.layers,
                         entities = d.entities, source = "SERVER",
-                        dxfContent = d.dxfContent, createdAt = now
+                        dxfContent = d.dxfContent, planId = d.planId, createdAt = now
                     )
                 }
             )

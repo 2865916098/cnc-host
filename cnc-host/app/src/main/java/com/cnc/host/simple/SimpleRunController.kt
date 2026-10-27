@@ -11,6 +11,7 @@ import com.cnc.host.sync.StatusDto
 import com.cnc.host.sync.SyncManager
 import com.cnc.model.cam.MotionType
 import com.cnc.model.cam.Toolpath
+import com.cnc.model.cam.ToolpathSegment
 import com.cnc.model.drawing.Point2D
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -24,8 +25,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 
-enum class RunPhase { IDLE, RUNNING, COMPLETED, FAILED, STOPPED, ESTOPPED }
+enum class RunPhase { IDLE, RUNNING, PAUSED, COMPLETED, FAILED, STOPPED, ESTOPPED }
 
 data class SimpleRunState(
     val taskName: String = "",
@@ -41,12 +43,15 @@ data class SimpleRunState(
     val finishedAt: Long? = null
 ) {
     val running: Boolean get() = phase == RunPhase.RUNNING
+    val paused: Boolean get() = phase == RunPhase.PAUSED
 }
 
 /**
  * 简易模式的加工作业执行器。
  *
  * 独立于页面生命周期：离开预览页进入监控页时作业继续执行。
+ *
+ * 支持 暂停/继续：暂停时取消当前协程但保留已发送段索引与上下文，继续时从下一段恢复。
  *
  * 安全边界：
  * - 急停直接调用设备实现（模拟器为 triggerEstop），不经过服务端
@@ -67,14 +72,33 @@ object SimpleRunController {
     @Volatile
     private var stopPhase: RunPhase? = null
 
+    // 暂停/继续所需的上下文：暂停时保留，继续时复用；停止/急停/完成后清空。
+    private var pendingSegments: List<ToolpathSegment> = emptyList()
+    private var nextIndex: Int = 0
+    private var pendingDrawingId: String = ""
+    private var pendingSpindleRpm: Int = DEFAULT_SPINDLE_RPM
+
     /** 开始执行刀路；同一时间只允许一个作业。 */
-    fun start(context: Context, taskName: String, drawingId: String, toolpath: Toolpath) {
-        if (_state.value.running) return
+    fun start(
+        context: Context,
+        taskName: String,
+        drawingId: String,
+        toolpath: Toolpath,
+        spindleRpm: Int = DEFAULT_SPINDLE_RPM
+    ) {
+        // 运行中或暂停时不允许重新开始；暂停应使用 resume()
+        if (_state.value.running || _state.value.phase == RunPhase.PAUSED) return
         job?.cancel()
         stopPhase = null
         val app = context.applicationContext
         val startedAt = System.currentTimeMillis()
         val segments = toolpath.segments
+
+        // 保存上下文，供暂停后继续使用
+        pendingSegments = segments
+        nextIndex = 0
+        pendingDrawingId = drawingId
+        pendingSpindleRpm = spindleRpm
 
         _state.value = SimpleRunState(
             taskName = taskName,
@@ -87,21 +111,69 @@ object SimpleRunController {
         scope.launch { reportStatus(app, _state.value) }
 
         job = scope.launch {
-            var phase = RunPhase.FAILED
-            var message = ""
-            try {
-                if (!device.isConnected()) {
-                    device.connect()
-                }
-                if (!device.isConnected()) {
-                    throw IllegalStateException("设备未连接，未下发任何运动指令")
-                }
+            runSegments(app, fromIndex = 0, segments = segments, spindleRpm = spindleRpm)
+        }
+    }
 
-                // 主轴启动（模拟器按输入 RPM 记录）；失败立即中止
+    /**
+     * 暂停：取消当前协程，保留已发送段索引。主轴保持转动，等待继续。
+     * 仅在 RUNNING 状态有效。
+     */
+    fun pause() {
+        if (!_state.value.running) return
+        stopPhase = null
+        _state.value = _state.value.copy(phase = RunPhase.PAUSED, message = "已暂停，可继续")
+        job?.cancel()
+    }
+
+    /**
+     * 继续：从暂停时的下一段恢复执行。
+     * 仅在 PAUSED 状态有效。
+     */
+    fun resume(context: Context) {
+        if (_state.value.phase != RunPhase.PAUSED) return
+        if (pendingSegments.isEmpty()) return
+        val app = context.applicationContext
+        _state.value = _state.value.copy(phase = RunPhase.RUNNING, message = "继续加工…")
+        scope.launch { reportStatus(app, _state.value) }
+
+        job = scope.launch {
+            runSegments(
+                app = app,
+                fromIndex = nextIndex,
+                segments = pendingSegments,
+                spindleRpm = pendingSpindleRpm
+            )
+        }
+    }
+
+    /**
+     * 执行刀路段的核心循环。
+     *
+     * @param fromIndex 起始段索引（暂停恢复时 > 0）
+     */
+    private suspend fun runSegments(
+        app: Context,
+        fromIndex: Int,
+        segments: List<ToolpathSegment>,
+        spindleRpm: Int
+    ) {
+        var phase = RunPhase.FAILED
+        var message = ""
+        try {
+            if (!device.isConnected()) {
+                device.connect()
+            }
+            if (!device.isConnected()) {
+                throw IllegalStateException("设备未连接，未下发任何运动指令")
+            }
+
+            // 首次启动（非暂停恢复）时启动主轴
+            if (fromIndex == 0) {
                 val spindleCmd = DeviceCommand.setSpindle(
                     commandId = "simple-spindle-on-${System.currentTimeMillis()}",
-                    taskId = drawingId,
-                    rpm = DEFAULT_SPINDLE_RPM,
+                    taskId = pendingDrawingId,
+                    rpm = spindleRpm,
                     on = true,
                     clockwise = true
                 )
@@ -109,74 +181,83 @@ object SimpleRunController {
                 if (spindleResult.isFailure) {
                     throw IllegalStateException("主轴启动失败：${spindleResult.exceptionOrNull()?.message ?: "未知原因"}")
                 }
+                _state.value = _state.value.copy(message = "加工中：M03 S$spindleRpm")
+            }
 
-                _state.value = _state.value.copy(message = "加工中：M03 S$DEFAULT_SPINDLE_RPM")
-                var lastReported = 0
+            var lastReported = ((fromIndex.toFloat() / segments.size.toFloat()) * 100).toInt()
 
-                for ((idx, seg) in segments.withIndex()) {
-                    if (!isActive) break
-                    val target = Point2D(seg.end.x, seg.end.y)
-                    val cmdId = "simple-${drawingId}-${idx}-${System.currentTimeMillis()}"
-                    val cmd = when (seg.motionType) {
-                        MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, drawingId, target)
-                        MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
-                            cmdId, drawingId, target,
-                            seg.feedMmPerMin.takeIf { it > 0.0 } ?: 100.0
-                        )
-                        MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, drawingId, target, 100.0)
-                    }
-
-                    val result = device.sendMotionCommand(cmd)
-                    val status = if (result.isSuccess) {
-                        result.getOrNull()?.status ?: CommandStatus.RESULT_UNKNOWN
-                    } else {
-                        when (val queued = device.queryCommandResult(cmdId).getOrNull()) {
-                            CommandStatus.RESULT_UNKNOWN,
-                            CommandStatus.EXECUTION_FAILED,
-                            CommandStatus.TIMEOUT,
-                            CommandStatus.REJECTED -> queued
-                            else -> CommandStatus.SEND_FAILED
-                        }
-                    }
-
-                    val progress = (idx + 1).toFloat() / segments.size.toFloat()
-                    _state.value = _state.value.copy(
-                        sentSegments = idx + 1,
-                        progress = progress,
-                        log = (_state.value.log + "[${idx + 1}/${segments.size}] ${seg.motionType} → $status").takeLast(80)
+            for (idx in fromIndex until segments.size) {
+                if (!coroutineContext.isActive) break
+                val seg = segments[idx]
+                val target = Point2D(seg.end.x, seg.end.y)
+                val cmdId = "simple-${pendingDrawingId}-${idx}-${System.currentTimeMillis()}"
+                val cmd = when (seg.motionType) {
+                    MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, pendingDrawingId, target)
+                    MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
+                        cmdId, pendingDrawingId, target,
+                        seg.feedMmPerMin.takeIf { it > 0.0 } ?: 100.0
                     )
+                    MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, pendingDrawingId, target, 100.0)
+                }
 
-                    if (status != CommandStatus.COMPLETED) {
-                        throw IllegalStateException("第 ${idx + 1} 段返回 $status，已停止，禁止盲目重发")
-                    }
-
-                    val percent = (progress * 100).toInt()
-                    if (percent >= lastReported + 10 || idx == segments.size - 1) {
-                        lastReported = percent
-                        reportStatus(app, _state.value.copy(message = "加工中 $percent%"))
+                val result = device.sendMotionCommand(cmd)
+                val status = if (result.isSuccess) {
+                    result.getOrNull()?.status ?: CommandStatus.RESULT_UNKNOWN
+                } else {
+                    when (val queued = device.queryCommandResult(cmdId).getOrNull()) {
+                        CommandStatus.RESULT_UNKNOWN,
+                        CommandStatus.EXECUTION_FAILED,
+                        CommandStatus.TIMEOUT,
+                        CommandStatus.REJECTED -> queued
+                        else -> CommandStatus.SEND_FAILED
                     }
                 }
 
-                phase = RunPhase.COMPLETED
-                message = "✓ 加工完成（${segments.size} 段）"
-            } catch (ce: CancellationException) {
-                phase = stopPhase ?: RunPhase.STOPPED
-                message = if (phase == RunPhase.ESTOPPED) "⚠ 急停触发，作业已中止" else "作业已停止"
-                throw ce
-            } catch (e: Exception) {
-                phase = RunPhase.FAILED
-                message = e.message ?: "执行失败"
-            } finally {
-                withContext(NonCancellable) {
-                    finish(app, phase, message)
+                val sentCount = idx + 1
+                val progress = sentCount.toFloat() / segments.size.toFloat()
+                _state.value = _state.value.copy(
+                    sentSegments = sentCount,
+                    progress = progress,
+                    log = (_state.value.log + "[$sentCount/${segments.size}] ${seg.motionType} → $status").takeLast(80)
+                )
+                // 推进下一段索引，供暂停恢复使用
+                nextIndex = sentCount
+
+                if (status != CommandStatus.COMPLETED) {
+                    throw IllegalStateException("第 $sentCount 段返回 $status，已停止，禁止盲目重发")
                 }
+
+                val percent = (progress * 100).toInt()
+                if (percent >= lastReported + 10 || idx == segments.size - 1) {
+                    lastReported = percent
+                    reportStatus(app, _state.value.copy(message = "加工中 $percent%"))
+                }
+            }
+
+            phase = RunPhase.COMPLETED
+            message = "✓ 加工完成（${segments.size} 段）"
+        } catch (ce: CancellationException) {
+            // 暂停（stopPhase == null）或停止/急停
+            phase = stopPhase ?: RunPhase.PAUSED
+            message = when (phase) {
+                RunPhase.ESTOPPED -> "⚠ 急停触发，作业已中止"
+                RunPhase.STOPPED -> "作业已停止"
+                else -> "已暂停"
+            }
+            throw ce
+        } catch (e: Exception) {
+            phase = RunPhase.FAILED
+            message = e.message ?: "执行失败"
+        } finally {
+            withContext(NonCancellable) {
+                finish(app, phase, message)
             }
         }
     }
 
     /** 受控停止（非硬件急停）。 */
     fun requestStop() {
-        if (!_state.value.running) return
+        if (!_state.value.running && _state.value.phase != RunPhase.PAUSED) return
         stopPhase = RunPhase.STOPPED
         _state.value = _state.value.copy(phase = RunPhase.STOPPED, message = "已请求受控停止")
         scope.launch { runCatching { device.requestStop() } }
@@ -205,8 +286,16 @@ object SimpleRunController {
     /** 回到空闲状态（已结束的作业）。 */
     fun reset() {
         if (_state.value.running) return
+        clearPending()
         _state.value = SimpleRunState()
         stopPhase = null
+    }
+
+    private fun clearPending() {
+        pendingSegments = emptyList()
+        nextIndex = 0
+        pendingDrawingId = ""
+        pendingSpindleRpm = DEFAULT_SPINDLE_RPM
     }
 
     private suspend fun finish(app: Context, phase: RunPhase, message: String) {
@@ -220,14 +309,22 @@ object SimpleRunController {
             error = if (phase == RunPhase.FAILED) finalMessage else previous.error
         )
 
-        // 停止主轴（失败仅记录日志，不覆盖作业结果）
-        runCatching { device.sendMotionCommand(DeviceCommand.setSpindle(
-            commandId = "simple-spindle-off-${System.currentTimeMillis()}",
-            taskId = previous.drawingId,
-            rpm = 0, on = false, clockwise = true
-        )) }
+        // 暂停时不清空上下文，也不停主轴，等待继续
+        if (phase != RunPhase.PAUSED) {
+            // 停止主轴（失败仅记录日志，不覆盖作业结果）
+            runCatching {
+                device.sendMotionCommand(
+                    DeviceCommand.setSpindle(
+                        commandId = "simple-spindle-off-${System.currentTimeMillis()}",
+                        taskId = previous.drawingId,
+                        rpm = 0, on = false, clockwise = true
+                    )
+                )
+            }
+            clearPending()
+        }
 
-        if (previous.startedAt > 0L) {
+        if (previous.startedAt > 0L && phase != RunPhase.PAUSED) {
             val status = when (phase) {
                 RunPhase.COMPLETED -> "SUCCESS"
                 RunPhase.FAILED -> "FAILED"
