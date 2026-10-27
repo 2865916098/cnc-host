@@ -1,0 +1,46 @@
+# ---- Gradle ----
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# ---- Android ----
+*.apk
+*.aab
+*.ap_
+*.dex
+local.properties
+
+# ---- IDE ----
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# ---- Kotlin ----
+*.kotlin_module
+.kotlin/
+
+# ---- 运行期数据（含真实用户数据，禁止入库）----
+# 注意：必须锚定到根目录，避免误伤 app 源码包 com.cnc.host.data
+/data/
+/server/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# ---- 打包/分发产物（zip 快照由构建生成）----
+*.zip
+
+# ---- 签名与密钥（防御性排除，当前仓库无此类文件）----
+*.jks
+*.keystore
+key.properties
+
+# ---- 日志 ----
+*.log
+logs/
+
+# ---- 操作系统 ----
+Thumbs.db
+Desktop.ini
