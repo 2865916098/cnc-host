@@ -15,7 +15,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -63,7 +63,7 @@ fun RegisterScreen(
         )
         Spacer(Modifier.height(20.dp))
 
-        OutlinedTextField(
+        KioskTextField(
             value = ui.unitName,
             onValueChange = viewModel::setUnitName,
             label = { Text("单位名称") },
@@ -71,7 +71,7 @@ fun RegisterScreen(
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
+        KioskTextField(
             value = ui.contactName,
             onValueChange = viewModel::setContactName,
             label = { Text("联系人姓名") },
@@ -79,7 +79,7 @@ fun RegisterScreen(
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
+        KioskTextField(
             value = ui.phone,
             onValueChange = viewModel::setPhone,
             label = { Text("联系电话") },
@@ -87,7 +87,7 @@ fun RegisterScreen(
             modifier = Modifier.fillMaxWidth()
         )
         Spacer(Modifier.height(10.dp))
-        OutlinedTextField(
+        KioskTextField(
             value = ui.serverAddress,
             onValueChange = viewModel::setServerAddress,
             label = { Text("服务器地址（只填 IP）") },

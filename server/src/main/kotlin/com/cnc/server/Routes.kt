@@ -92,8 +92,11 @@ fun Application.cncServerModule(adminToken: String) {
     install(Authentication) {
         bearer("admin") {
             authenticate { credential ->
-                // 兼容环境变量管理口令，以及账号密码登录签发的会话 token
-                if (credential.token == adminToken || Db.isValidSession(credential.token)) {
+                // 兼容：环境变量管理口令 / 后台登录会话 token / 注册设备的设备令牌
+                if (credential.token == adminToken ||
+                    Db.isValidSession(credential.token) ||
+                    Db.isValidDeviceToken(credential.token)
+                ) {
                     io.ktor.server.auth.UserIdPrincipal("admin")
                 } else {
                     null
@@ -404,6 +407,52 @@ fun Application.cncServerModule(adminToken: String) {
                         )
                     )
                     call.respond(SimpleResult(ok = true, message = "已发布 v$versionName（$versionCode），${savedBytes / 1024} KB"))
+                }
+                // ===== 一键发布最新构建：扫描构建目录，无需手动选择本地 APK =====
+                get("/app-latest-candidate") {
+                    val c = ApkScanner().latest()
+                    if (c == null) {
+                        call.respond(ApkCandidateResult(found = false))
+                    } else {
+                        call.respond(
+                            ApkCandidateResult(
+                                found = true, path = c.path, fileName = c.fileName,
+                                versionCode = c.versionCode, versionName = c.versionName,
+                                sizeBytes = c.sizeBytes, modifiedAt = c.modifiedAt
+                            )
+                        )
+                    }
+                }
+                post("/app-publish-latest") {
+                    val body = runCatching { call.receive<PublishLatestRequest>() }
+                        .getOrDefault(PublishLatestRequest())
+                    val c = ApkScanner().latest()
+                    if (c == null) {
+                        call.respond(
+                            HttpStatusCode.NotFound,
+                            SimpleResult(ok = false, message = "未找到可用 APK 构建产物（请先用 gradlew assembleRelease/assembleDebug 构建，或设置 CNC_APK_DIR）")
+                        )
+                        return@post
+                    }
+                    val target = apkFile()
+                    target.parentFile?.mkdirs()
+                    File(c.path).copyTo(target, overwrite = true)
+                    Db.publishAppVersion(
+                        AppVersionInfo(
+                            versionCode = c.versionCode,
+                            versionName = c.versionName,
+                            changelog = body.changelog,
+                            sha256 = sha256Of(target),
+                            sizeBytes = c.sizeBytes,
+                            publishedAt = System.currentTimeMillis()
+                        )
+                    )
+                    call.respond(
+                        SimpleResult(
+                            ok = true,
+                            message = "已发布最新构建 v${c.versionName}（${c.versionCode}），${c.sizeBytes / 1024} KB，来自 ${c.fileName}"
+                        )
+                    )
                 }
                 post("/admin-password") {
                     val body = call.receive<AdminPasswordUpdate>()

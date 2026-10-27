@@ -66,6 +66,15 @@ object ServerPrefs {
     fun deviceJson(context: Context): String? = prefs(context).getString(K_DEVICE_JSON, null)
     fun commJson(context: Context): String? = prefs(context).getString(K_COMM_JSON, null)
 
+    /** 清除鉴权信息（清除数据重新注册时调用）；保留 baseUrl 便于重新注册沿用地址。 */
+    fun clearAuth(context: Context) {
+        prefs(context).edit()
+            .remove(K_TOKEN)
+            .remove(K_DEVICE_ID)
+            .putBoolean(K_ENABLED, false)
+            .apply()
+    }
+
     fun savePendingTasks(context: Context, json: String) {
         prefs(context).edit().putString(K_PENDING_TASKS, json).apply()
     }

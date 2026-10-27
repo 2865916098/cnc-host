@@ -1,6 +1,7 @@
 package com.cnc.host.setup
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -93,7 +94,9 @@ object WifiSetup {
         return when {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
                 val ssid = runCatching {
-                    (caps.transportInfo as? WifiInfo)?.ssid?.removePrefix("\"")?.removeSuffix("\"")
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        (caps.transportInfo as? WifiInfo)?.ssid?.removePrefix("\"")?.removeSuffix("\"")
+                    } else null
                 }.getOrNull()
                 if (ssid.isNullOrBlank() || ssid == "<unknown ssid>") "WiFi 已连接" else "WiFi：$ssid"
             }
@@ -109,6 +112,7 @@ object WifiSetup {
      * @param onResult 去重并按信号排序后的热点列表
      * @param onError  扫描不可用时的原因提示
      */
+    @SuppressLint("MissingPermission")
     fun startScan(context: Context, onResult: (List<WifiItem>) -> Unit, onError: (String) -> Unit) {
         val app = context.applicationContext
         if (!hasScanPermission(app)) {

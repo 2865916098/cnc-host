@@ -245,6 +245,22 @@ data class AppVersionInfo(
     val publishedAt: Long = 0L
 )
 
+/** 「最新构建」候选 APK（服务端扫描构建目录得到）。 */
+@Serializable
+data class ApkCandidateResult(
+    val found: Boolean = false,
+    val path: String = "",
+    val fileName: String = "",
+    val versionCode: Int = 0,
+    val versionName: String = "",
+    val sizeBytes: Long = 0L,
+    val modifiedAt: Long = 0L
+)
+
+/** 一键发布最新构建的请求体。 */
+@Serializable
+data class PublishLatestRequest(val changelog: String = "")
+
 /** 注册后返回给客户端的设备信息（含权限）。 */
 @Serializable
 data class DeviceInfo(
@@ -256,7 +272,9 @@ data class DeviceInfo(
     val registeredAt: Long = 0L,
     val lastSeen: Long = 0L,
     val online: Boolean = false,
-    val permissions: ClientPermissions = ClientPermissions()
+    val permissions: ClientPermissions = ClientPermissions(),
+    /** 设备令牌：注册时签发，客户端据此访问配置/任务/状态接口（心跳响应也携带，老客户端自动补录）。 */
+    val token: String = ""
 )
 
 /** 后台返回的设备列表项（含在线状态与客户端版本号）。 */

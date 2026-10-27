@@ -4,6 +4,7 @@ import android.content.Context
 import com.cnc.host.sync.ClientPermissionsDto
 import com.cnc.host.sync.ServerApi
 import com.cnc.host.sync.ServerPrefs
+import com.cnc.host.sync.SyncManager
 import com.cnc.host.update.AppUpdate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,11 +31,15 @@ object PermissionsHolder {
 }
 
 /**
- * 设备心跳：定期向服务端上报存活并拉取最新权限。
+ * 设备心跳：每 10 秒向服务端上报存活并拉取最新权限。
  *
- * 后台修改功能权限后，客户端在下一次心跳自动生效。
+ * - 后台修改功能权限后，客户端 10 秒内自动生效
+ * - 心跳响应携带设备令牌：老版本客户端本地无令牌时自动补录（自愈）
+ * - 顺带探测配置版本号，变化即触发全量同步，任务页徽标实时反映在线状态
  */
 object DeviceHeartbeat {
+
+    private const val INTERVAL_MS = 10_000L
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var job: Job? = null
@@ -50,15 +55,31 @@ object DeviceHeartbeat {
                     val (_, versionName) = AppUpdate.localVersion(context)
                     val identity = SetupPrefs.load(context)
                     if (identity.deviceId.isNotBlank()) {
-                        val info = ServerApi(settings).heartbeat(identity.deviceId, versionName).getOrNull()
+                        val api = ServerApi(settings)
+                        val info = api.heartbeat(identity.deviceId, versionName).getOrNull()
                         if (info != null) {
                             SetupPrefs.savePermissions(context, info.permissions)
                             PermissionsHolder.update(info.permissions)
+                            // 老设备自愈：本地还没有令牌时，用心跳返回的令牌补齐鉴权
+                            if (settings.token.isBlank() && info.token.isNotBlank()) {
+                                ServerPrefs.save(
+                                    context,
+                                    settings.copy(token = info.token, deviceId = info.id, enabled = true)
+                                )
+                            }
+                            SyncManager.refresh(context)
+                            SyncManager.markOnline(true)
+                            // 轻量探测配置版本，变化才全量同步（避免每 10 秒拉全量）
+                            if (SyncManager.remoteConfigChanged(context)) {
+                                SyncManager.syncNow(context)
+                            }
+                        } else {
+                            SyncManager.markOnline(false)
                         }
                     }
                     AppUpdate.check(context)
                 }
-                delay(30_000)
+                delay(INTERVAL_MS)
             }
         }
     }

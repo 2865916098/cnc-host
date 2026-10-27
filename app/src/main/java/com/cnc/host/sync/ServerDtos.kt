@@ -159,6 +159,9 @@ data class StatusDto(
 
 data class SimpleOkDto(val ok: Boolean = false, val message: String = "", val id: String = "")
 
+/** 配置版本号（/config/version 轻量探测）。 */
+data class ConfigVersionDto(val version: Long = 0L)
+
 // ===================== 设备注册与权限 =====================
 
 data class ClientPermissionsDto(
@@ -209,7 +212,9 @@ data class DeviceInfoDto(
     val registeredAt: Long = 0L,
     val lastSeen: Long = 0L,
     val online: Boolean = false,
-    val permissions: ClientPermissionsDto = ClientPermissionsDto()
+    val permissions: ClientPermissionsDto = ClientPermissionsDto(),
+    /** 服务端签发的设备令牌：凭它访问配置/任务/状态接口。 */
+    val token: String = ""
 )
 
 data class AdminVerifyRequestDto(val password: String = "")

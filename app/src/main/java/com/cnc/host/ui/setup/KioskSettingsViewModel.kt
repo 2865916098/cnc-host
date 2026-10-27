@@ -105,29 +105,21 @@ class KioskSettingsViewModel(application: Application) : AndroidViewModel(applic
     }
 
     /**
-     * 清除数据重新注册：清掉本机注册信息后重启应用，回到「配网 → 注册」流程。
-     * 注意：服务端仍保留该设备记录，重新注册会被拒绝，需管理员先在后台「注销」。
+     * 清除数据重新注册：清掉本机注册信息与设备令牌后，直接前台重启主界面，
+     * 回到「配网 → 权限 → 注册」流程。
+     *
+     * 注意：不能用 AlarmManager+杀进程重启——Android 12+/MIUI 会拦截后台
+     * 启动 Activity 导致重启丢失。当前应用在前台，直接 startActivity 可靠。
+     * 服务端仍保留该设备记录，重新注册会被拒绝，需管理员先在后台「注销」。
      */
     fun resetRegistration() {
         val app = getApplication<Application>()
         SetupPrefs.clearRegistration(app)
+        ServerPrefs.clearAuth(app)
         SetupPrefs.setExited(app, false)
-        // 1 秒后重启进程，MainActivity 重新读取注册状态进入注册流程
-        runCatching {
-            val intent = app.packageManager.getLaunchIntentForPackage(app.packageName)
-                ?.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK)
-                ?: return@runCatching
-            val pi = android.app.PendingIntent.getActivity(
-                app, 0, intent,
-                android.app.PendingIntent.FLAG_ONE_SHOT or android.app.PendingIntent.FLAG_IMMUTABLE
-            )
-            val am = app.getSystemService(android.app.Application.ALARM_SERVICE) as android.app.AlarmManager
-            am.set(
-                android.app.AlarmManager.ELAPSED_REALTIME,
-                android.os.SystemClock.elapsedRealtime() + 1000L,
-                pi
-            )
-        }
-        kotlin.system.exitProcess(0)
+        val intent = android.content.Intent(app, com.cnc.host.MainActivity::class.java).addFlags(
+            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK
+        )
+        app.startActivity(intent)
     }
 }

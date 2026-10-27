@@ -123,9 +123,16 @@ class RegisterViewModel(application: Application) : AndroidViewModel(application
                         )
                     )
                     SetupPrefs.savePermissions(app, info.permissions)
+                    // 同时写入设备令牌/设备编号并启用自动同步：
+                    // 此后配置同步、任务上报、状态上报都凭设备令牌直连服务端
                     ServerPrefs.save(
                         app,
-                        ServerPrefs.load(app).copy(baseUrl = info.serverAddress)
+                        ServerPrefs.load(app).copy(
+                            baseUrl = info.serverAddress,
+                            token = info.token,
+                            deviceId = info.id,
+                            enabled = true
+                        )
                     )
                     _ui.update { it.copy(loading = false, done = true) }
                 },

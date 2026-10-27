@@ -37,6 +37,11 @@ class ServerApi(private val settings: ServerSettings) {
         gson.fromJson(request("GET", "/api/v1/config"), ConfigDto::class.java)
     }
 
+    /** 轻量配置版本探测（心跳用，避免每次拉全量配置）。 */
+    suspend fun fetchConfigVersion(): Result<ConfigVersionDto> = runCatching {
+        gson.fromJson(request("GET", "/api/v1/config/version"), ConfigVersionDto::class.java)
+    }
+
     suspend fun uploadTask(task: TaskDto): Result<Unit> = runCatching {
         request("POST", "/api/v1/tasks", gson.toJson(task))
         Unit

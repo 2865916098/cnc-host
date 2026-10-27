@@ -69,6 +69,7 @@ import com.cnc.host.ui.review.ReviewScreen
 import com.cnc.host.ui.settings.SettingsScreen
 import com.cnc.host.ui.setup.KioskSettingsOverlay
 import com.cnc.host.ui.setup.NetworkSetupScreen
+import com.cnc.host.ui.setup.PermissionsSetupScreen
 import com.cnc.host.ui.setup.RegisterScreen
 import com.cnc.host.ui.simple.SimpleAlarmsScreen
 import com.cnc.host.ui.simple.SimpleMonitorScreen
@@ -117,11 +118,28 @@ class MainActivity : ComponentActivity() {
             }
         })
         enableEdgeToEdge()
+        // 客户端统一使用内嵌键盘，禁止系统输入法弹出
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        hideSystemBars()
         setContent {
             CncTheme {
                 CncHostApp()
             }
         }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // 下拉通知栏/上滑手势会短暂唤出系统栏，重新获得焦点时立刻再隐藏
+        if (hasFocus) hideSystemBars()
+    }
+
+    /** Kiosk 沉浸式：隐藏状态栏与导航栏，页面不被系统 UI 遮挡，也减少误触退出的入口。 */
+    private fun hideSystemBars() {
+        val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
     }
 
     override fun onUserLeaveHint() {
@@ -162,12 +180,13 @@ fun CncHostApp() {
         mutableStateOf(SetupPrefs.load(context).setupCompleted)
     }
 
-    // 首次启动引导流程：0=网络配置，1=设备注册
+    // 首次启动引导流程：0=网络配置，1=权限与自启，2=设备注册
     var setupStep by rememberSaveable { mutableIntStateOf(0) }
 
     if (!setupCompleted) {
         when (setupStep) {
             0 -> NetworkSetupScreen(onNext = { setupStep = 1 })
+            1 -> PermissionsSetupScreen(onNext = { setupStep = 2 })
             else -> RegisterScreen(onRegistered = {
                 setupCompleted = true
                 PermissionsHolder.load(context)

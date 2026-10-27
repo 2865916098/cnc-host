@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -25,6 +25,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cnc.ui.theme.CncColors
@@ -55,7 +56,7 @@ fun DeviceScreen(modifier: Modifier = Modifier, vm: DeviceViewModel = viewModel(
             Spacer(Modifier.height(12.dp))
             var name by remember(c.name) { mutableStateOf(c.name) }
             Text("设备名称", style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-            OutlinedTextField(name, onValueChange = { name = it; vm.update { cfg -> cfg.copy(name = it) } }, Modifier.fillMaxWidth(), singleLine = true)
+            KioskTextField(name, onValueChange = { name = it; vm.update { cfg -> cfg.copy(name = it) } }, Modifier.fillMaxWidth(), singleLine = true)
 
             Spacer(Modifier.height(8.dp))
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -90,6 +91,6 @@ private fun FieldWithLabel(label: String, value: String, onChange: (String) -> U
     var text by remember(value) { mutableStateOf(value) }
     Column(Modifier.fillMaxWidth()) {
         Text(label, style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-        OutlinedTextField(text, onValueChange = { text = it; onChange(it) }, Modifier.fillMaxWidth(), singleLine = true)
+        KioskTextField(text, onValueChange = { text = it; onChange(it) }, Modifier.fillMaxWidth(), singleLine = true, keyboardType = KeyboardType.Decimal)
     }
 }

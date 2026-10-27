@@ -35,9 +35,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.cnc.host.ui.components.KioskTextField
 import com.cnc.ui.theme.CncColors
 import com.cnc.ui.theme.CncTypography
 
@@ -192,10 +194,11 @@ fun MachiningScreen(
                 var rpmText by remember { mutableStateOf("1200") }
                 val rpm = rpmText.toIntOrNull() ?: 0
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                    androidx.compose.material3.OutlinedTextField(
+                    KioskTextField(
                         value = rpmText,
                         onValueChange = { input -> rpmText = input.filter { it.isDigit() } },
-                        label = { Text("RPM") }, modifier = Modifier, singleLine = true
+                        label = { Text("RPM") }, modifier = Modifier, singleLine = true,
+                        keyboardType = KeyboardType.Number
                     )
                 }
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {

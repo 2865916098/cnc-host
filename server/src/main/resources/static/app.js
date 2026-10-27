@@ -9,6 +9,7 @@
     tasks: [],
     devices: [],
     appVersion: null,
+    apkCandidate: null,
     status: null,
     tab: "overview",
     ws: null,
@@ -103,6 +104,7 @@
     S.tasks = await api("/api/v1/tasks");
     S.devices = await api("/api/v1/devices").catch(() => []);
     S.appVersion = await api("/api/v1/app-version-info").catch(() => null);
+    S.apkCandidate = await api("/api/v1/app-latest-candidate").catch(() => null);
     $("cfg-version").textContent = S.config.version;
     renderNav();
     render();
@@ -726,19 +728,30 @@
     const ver = S.appVersion;
     const verText = ver && ver.versionCode > 0
       ? `当前已发布：<b>v${esc(ver.versionName)}</b>（versionCode ${ver.versionCode}，${Math.round((ver.sizeBytes || 0) / 1024)} KB，${fmtTime(ver.publishedAt)}）${ver.changelog ? "<br>更新说明：" + esc(ver.changelog) : ""}`
-      : "尚未发布客户端版本。上传 APK 后，在线设备会收到「发现新版本」提示，确认后自动下载安装。";
+      : "尚未发布客户端版本。发布后在线设备会收到「发现新版本」提示，确认后自动下载安装。";
+    const cand = S.apkCandidate;
+    const candHtml = cand && cand.found
+      ? `<div class="hint-box" style="margin-bottom:10px">
+           检测到最新构建：<b>v${esc(cand.versionName)}</b>（versionCode ${cand.versionCode}，${Math.round(cand.sizeBytes / 1024)} KB，${esc(cand.fileName)}，${fmtTime(cand.modifiedAt)}）
+           <button class="primary" style="margin-left:12px" onclick="publishLatestApk()">一键发布此版本</button>
+         </div>`
+      : `<div class="desc" style="margin-bottom:10px">未检测到构建产物。请先在电脑上执行 gradlew assembleRelease（或 assembleDebug），服务端会自动识别 app/build/outputs/apk 下的最新 APK。</div>`;
     return `
-      <div class="hint-box">客户端首次打开会先配置网络并注册（单位、姓名、电话、服务器地址）。注册后可在此查看在线状态（90 秒无心跳视为离线），并按设备开关功能权限。本页每 3 秒自动刷新。</div>
+      <div class="hint-box">客户端首次打开会先配置网络并注册（单位、姓名、电话、服务器地址）。注册后可在此查看在线状态（25 秒无心跳视为离线），并按设备开关功能权限。本页每 3 秒自动刷新。</div>
       <div class="panel"><h3>已注册设备</h3>${table}</div>
       <div class="panel"><h3>客户端版本发布（自动更新）</h3>
         <div class="desc" style="margin-bottom:10px">${verText}</div>
-        <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:10px">
-          <div><label class="form-label">APK 文件</label><input type="file" id="apk-file" accept=".apk"></div>
-          <div style="width:120px"><label class="form-label">versionCode</label><input type="number" id="apk-code" class="input" placeholder="如 ${ver && ver.versionCode ? ver.versionCode + 1 : 2}"></div>
-          <div style="width:160px"><label class="form-label">版本名</label><input type="text" id="apk-name" class="input" placeholder="如 1.1.0"></div>
-        </div>
+        ${candHtml}
         <div style="margin-top:8px"><label class="form-label">更新说明（可选）</label><input type="text" id="apk-changelog" class="input" placeholder="修复了…"></div>
-        <div class="row" style="margin-top:10px"><button class="primary" onclick="publishApk()">发布新版本</button></div>
+        <details style="margin-top:10px">
+          <summary class="desc" style="cursor:pointer">手动上传 APK（兜底，一般不用）</summary>
+          <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:10px; margin-top:8px">
+            <div><label class="form-label">APK 文件</label><input type="file" id="apk-file" accept=".apk"></div>
+            <div style="width:120px"><label class="form-label">versionCode</label><input type="number" id="apk-code" class="input" value="${cand && cand.found ? cand.versionCode : ""}" placeholder="如 ${ver && ver.versionCode ? ver.versionCode + 1 : 2}"></div>
+            <div style="width:160px"><label class="form-label">版本名</label><input type="text" id="apk-name" class="input" value="${cand && cand.found ? esc(cand.versionName) : ""}" placeholder="如 1.1.0"></div>
+            <div><button onclick="publishApk()">上传并发布</button></div>
+          </div>
+        </details>
         <div class="desc" style="margin-top:8px">注意：发新版时需把 app/build.gradle.kts 里的 versionCode 加 1 再构建，客户端按 versionCode 判断是否为新版本。</div>
       </div>
       <div class="panel"><h3>管理员账号密码
@@ -772,6 +785,16 @@
     try {
       await api(`/api/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
       toast("设备已注销");
+      await loadAll();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  /** 一键发布服务端扫描到的最新构建，无需手动选择 APK。 */
+  window.publishLatestApk = async function () {
+    const changelog = $("apk-changelog") ? $("apk-changelog").value.trim() : "";
+    try {
+      const data = await api("/api/v1/app-publish-latest", { method: "POST", body: { changelog } });
+      toast(data.message || "发布成功");
       await loadAll();
     } catch (e) { toast(e.message, true); }
   };

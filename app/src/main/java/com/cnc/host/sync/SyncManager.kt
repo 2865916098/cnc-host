@@ -60,6 +60,24 @@ object SyncManager {
         _state.update { it.copy(configured = settings.configured, lastMessage = "设置已保存") }
     }
 
+    /** 心跳结果联动在线状态（任务页徽标实时刷新），不触碰其它字段。 */
+    fun markOnline(online: Boolean) {
+        _state.update { it.copy(online = online) }
+    }
+
+    /**
+     * 轻量探测远端配置版本是否与本地缓存不同。
+     * 未配置鉴权或网络失败时返回 false（不触发同步）。
+     */
+    suspend fun remoteConfigChanged(context: Context): Boolean {
+        val conf = ServerPrefs.load(context)
+        if (!conf.configured) return false
+        val remote = ServerApi(conf).fetchConfigVersion().getOrNull() ?: return false
+        val cached = CncDatabase.getInstance(context).syncMetaDao()
+            .get("config_version")?.value?.toLongOrNull() ?: 0L
+        return remote.version != cached
+    }
+
     /** 仅验证地址与口令，不写配置。 */
     suspend fun testConnection(context: Context, settings: ServerSettings): Result<String> {
         val api = ServerApi(settings)

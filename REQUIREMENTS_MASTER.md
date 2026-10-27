@@ -50,6 +50,14 @@
 | REQ-C03 | APK 自动更新（发布→弹窗→下载→SHA-256→安装） | 🔶 | /app-publish、/app-version、/app-download、AppUpdate.kt | 无验签（P0）；安装回读未验证 |
 | REQ-C04 | 后台修改已注册设备信息 | ✅ | 设备编辑接口+后台界面 | 真机/curl |
 | REQ-C05 | 后台显示客户端版本号+实时在线状态（90s 判离线） | ✅ | versionCode 3/1.2.0 上报；last_seen 判定 | 真机 |
+| REQ-C06 | 客户端沉浸式：状态栏不遮挡页面（2026-10-28 指令 N1） | ✅ | MainActivity hideSystemBars + onWindowFocusChanged 重隐，BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE | 待真机验收 |
+| REQ-C07 | Kiosk 防退出加强（2026-10-28 指令 N2） | ✅ | KioskService 700ms 看门狗 + excludeFromRecents + showWhenLocked/turnScreenOn + SYSTEM_ALERT_WINDOW 引导 | 待真机验收 |
+| REQ-C08 | 清除数据后重新进入注册流程（2026-10-28 指令 N3） | ✅ | KioskSettingsViewModel.resetRegistration 改前台 in-place 重启（清 SetupPrefs+ServerPrefs.clearAuth，NEW_TASK\|CLEAR_TASK） | 待真机验收 |
+| REQ-C09 | 开机自启可靠落地（2026-10-28 指令 N4） | ✅ | BootReceiver 增加 QUICKBOOT_POWERON；新增第 2 步权限引导（悬浮窗/电池白名单/厂商自启页跳转） | 待真机验收（厂商自启设置项需手动开） |
+| REQ-C10 | 内嵌输入法，禁用系统输入法（2026-10-28 指令 N5） | ✅ | KioskTextField + KioskKeyboardDialog（数字/QWERTY 双面板）；全局 SOFT_INPUT_STATE_ALWAYS_HIDDEN；30 处输入框全替换 | 待真机验收 |
+| REQ-C11 | 任务菜单连接状态与配置同步修复（2026-10-28 指令 N6） | ✅ | 根因=注册未存 token/deviceId；服务端签发 device_token（注册返回+心跳自愈+老库回填），bearer 三源鉴权；心跳 10s 联动徽标 + config/version 探测变化即全量同步 | 待真机验收 |
+| REQ-C12 | 在线/离线状态实时更新（2026-10-28 指令 N7） | ✅ | 心跳 30s→10s；离线判定 90s→25s；后台设备页 3s 轮询保持 | 待真机验收 |
+| REQ-C13 | 版本发布默认最新 APK 一键发布（2026-10-28 指令 N8） | ✅ | AxmlVersionReader（二进制 AXML 解析 versionCode/versionName）+ ApkScanner 扫描构建目录；/app-latest-candidate + /app-publish-latest；后台「一键发布」按钮，手动上传折叠兜底 | 待验收（服务端跑一遍发布） |
 
 ## D 系列：修改/替换记录【正式/会话混合】
 
@@ -86,6 +94,6 @@
 
 ## 统计
 
-- 正式需求：A 18 + B 7 + F 6 = 31 项；会话新增 5 项；变更 4 项；建议 8 项。
+- 正式需求：A 18 + B 7 + F 6 = 31 项；会话新增 13 项（C01-C13，其中 C06-C13 为 2026-10-28 指令 N1-N8 落地）；变更 4 项；建议 8 项。
 - 实现状态（A+B 25 项功能需求口径）：✅T 6、✅ 6、🔶 8、🎭 1、❌ 4。
 - 矛盾/不一致清单：见 OPEN_QUESTIONS.md 第三节。

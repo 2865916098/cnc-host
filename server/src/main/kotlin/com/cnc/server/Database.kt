@@ -204,6 +204,10 @@ object Db {
             c.createStatement().use { st ->
                 runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN hardware_id TEXT NOT NULL DEFAULT ''") }
                 runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''") }
+                // 设备令牌：客户端凭此访问配置/任务/状态接口（管理口令不下发到平板）
+                runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN device_token TEXT NOT NULL DEFAULT ''") }
+                // 老设备回填令牌，客户端下次心跳时自动取回
+                st.executeUpdate("UPDATE devices SET device_token = lower(hex(randomblob(16))) WHERE device_token = ''")
                 // 同一台设备（按硬件标识）只能注册一次（必须在列迁移之后创建）
                 st.executeUpdate(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_hardware_id ON devices(hardware_id) WHERE hardware_id != ''"
@@ -789,12 +793,14 @@ object Db {
         val id = req.deviceId.ifBlank { "dev-${UUID.randomUUID().toString().take(8)}" }
         val now = System.currentTimeMillis()
         val existingPerms = c.getDeviceRaw(id)?.let { decodePermissions(it) } ?: ClientPermissions()
+        // 签发设备令牌：客户端后续用它访问配置/任务/状态接口
+        val token = UUID.randomUUID().toString().replace("-", "")
         c.prepareStatement(
             """
             INSERT OR REPLACE INTO devices(
                 id, unit_name, contact_name, phone, server_address,
-                registered_at, last_seen, online, permissions, hardware_id, app_version
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                registered_at, last_seen, online, permissions, hardware_id, app_version, device_token
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """.trimIndent()
         ).use { ps ->
             ps.setString(1, id)
@@ -808,13 +814,14 @@ object Db {
             ps.setString(9, json.encodeToString(ClientPermissions.serializer(), existingPerms))
             ps.setString(10, req.hardwareId)
             ps.setString(11, req.appVersion)
+            ps.setString(12, token)
             ps.executeUpdate()
         }
         DeviceInfo(
             id = id, unitName = req.unitName, contactName = req.contactName,
             phone = req.phone, serverAddress = req.serverAddress,
             registeredAt = now, lastSeen = now, online = true,
-            permissions = existingPerms
+            permissions = existingPerms, token = token
         )
     }
 
@@ -843,7 +850,7 @@ object Db {
         val permsRaw = c.getDeviceRaw(id) ?: return@withConn null
         var info: DeviceInfo? = null
         c.prepareStatement(
-            "SELECT unit_name, contact_name, phone, server_address, registered_at, last_seen, online FROM devices WHERE id = ?"
+            "SELECT unit_name, contact_name, phone, server_address, registered_at, last_seen, online, device_token FROM devices WHERE id = ?"
         ).use { ps ->
             ps.setString(1, id)
             ps.executeQuery().use { rs ->
@@ -857,7 +864,8 @@ object Db {
                         registeredAt = rs.getLong("registered_at"),
                         lastSeen = rs.getLong("last_seen"),
                         online = isOnline(rs.getLong("last_seen")),
-                        permissions = decodePermissions(permsRaw)
+                        permissions = decodePermissions(permsRaw),
+                        token = rs.getString("device_token") ?: ""
                     )
                 }
             }
@@ -890,9 +898,9 @@ object Db {
         }
     }
 
-    /** 在线判定：心跳周期 30 秒，90 秒内无心跳视为离线（按读取时实时计算）。 */
+    /** 在线判定：心跳周期 10 秒，25 秒内无心跳视为离线（按读取时实时计算）。 */
     private fun isOnline(lastSeen: Long): Boolean =
-        lastSeen > 0 && System.currentTimeMillis() - lastSeen < 90_000L
+        lastSeen > 0 && System.currentTimeMillis() - lastSeen < 25_000L
 
     fun updateDevicePermissions(id: String, permissions: ClientPermissions): Boolean = withConn { c ->
         val changed = c.prepareStatement("UPDATE devices SET permissions = ? WHERE id = ?").use { ps ->
@@ -956,6 +964,15 @@ object Db {
             ps.setString(1, id)
             ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
         }
+
+    /** 设备令牌校验：注册设备签发的令牌，允许访问配置/任务/状态接口。 */
+    fun isValidDeviceToken(token: String): Boolean = withConn { c ->
+        if (token.isBlank()) return@withConn false
+        c.prepareStatement("SELECT 1 FROM devices WHERE device_token = ? AND device_token != '' LIMIT 1").use { ps ->
+            ps.setString(1, token)
+            ps.executeQuery().use { rs -> rs.next() }
+        }
+    }
 
     /** 校验客户端传入的管理员密码。默认密码 123456，可在后台修改。 */
     fun verifyAdminPassword(password: String): Boolean = withConn { c ->
