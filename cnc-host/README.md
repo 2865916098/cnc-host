@@ -173,3 +173,67 @@ app/build/outputs/apk/debug/app-debug.apk
 - 「退出到安卓桌面」为临时窗口（20 秒），到期后看门狗自动重新拉起前台
 - 管理员密码离线校验依赖本机缓存，首次必须联网校验后才会缓存
 - 服务端为单管理员令牌鉴权，设备权限按设备粒度配置，无多用户分级
+
+## 开发上下文（AI 接手必读）
+
+> 新任务打开本仓库时，请先阅读本节，即可了解项目全貌与当前进度，无需用户重复沟通。
+
+### 项目定位
+
+两轴数控车床 Android 上位机，C/S 架构：
+- **Android 客户端**（`app/`）：横屏工业平板，Kotlin + Jetpack Compose，Kiosk 模式运行
+- **服务端**（`server/`）：Kotlin + Ktor + SQLite，REST + WebSocket + 网页管理后台
+
+### 已完成功能（全部编译通过、测试通过、冒烟通过）
+
+1. **Kiosk 保活**
+   - `app/src/main/java/com/cnc/host/receiver/BootReceiver.kt`：开机自启，拉起 MainActivity + KioskService
+   - `app/src/main/java/com/cnc/host/service/KioskService.kt`：前台服务，看门狗每 1500ms 检测 `MainActivity.isResumed`，不在前台且不在退出窗口则自动 `startActivity` 拉起
+   - `app/src/main/java/com/cnc/host/CncApplication.kt`：`installCrashRestartHandler` 通过 AlarmManager 1.5s 后重启 + `Process.killProcess`
+   - `MainActivity` 维护 `companion object { var isResumed = false }`，`onResume`/`onPause` 置位
+
+2. **首次启动注册流程**
+   - `NetworkSetupScreen`：跳转系统 WiFi/移动数据设置，「我已联网」进入下一步
+   - `RegisterScreen` + `RegisterViewModel`：单位/姓名/电话/服务器地址 → `ServerApi.registerDevice` → 写 `SetupPrefs.saveIdentity`（setupCompleted=true）+ `savePermissions` + 回写 `ServerPrefs.baseUrl`
+   - `SetupPrefs`（`setup/SetupPrefs.kt`）：`DeviceIdentity(setupCompleted, deviceId, unitName, contactName, phone, serverAddress, adminPassword, permissions)`，另有 `setExitWindow`/`exitUntil` 控制退出窗口
+   - `MainActivity` 启动时读 `SetupPrefs.load`，`!setupCompleted` 则渲染 NetworkSetup → Register，否则进入主界面
+
+3. **后台设备管理**（服务端）
+   - `Database.kt`：`devices` 表（id, unit_name, contact_name, phone, server_address, registered_at, last_seen, online, permissions TEXT）；`meta.admin_password` 默认 `admin123`
+   - 开放接口：`POST /api/v1/devices/register`、`GET /api/v1/devices/{id}`、`POST /api/v1/devices/{id}/heartbeat`、`POST /api/v1/devices/{id}/verify-admin`
+   - 管理接口：`GET /api/v1/devices`、`PUT /api/v1/devices/{id}/permissions`、`POST /api/v1/admin-password`
+   - 后台网页 `static/app.js`：设备列表、权限勾选弹窗、修改管理员密码
+
+4. **客户端设置面板**
+   - `TopStatusBar` 右上角设置图标（`Icons.Default.Settings`），`onSettings` 回调
+   - `KioskSettingsOverlay`：先 AlertDialog 输入管理员密码 → `KioskSettingsViewModel.verifyPassword`（优先 `ServerApi.verifyAdminPassword`，失败回退 `SetupPrefs.adminPassword` 缓存）→ 通过后显示服务器地址输入 + 「退出到安卓桌面」按钮（`setExitWindow(20)` + `moveTaskToBack(true)`）
+
+5. **权限门禁**
+   - `PermissionsHolder.flow`（`setup/DeviceHeartbeat.kt`）：`StateFlow<ClientPermissionsDto>`，`load`/`update`
+   - `DeviceHeartbeat.start`：每 30s 调 `ServerApi.heartbeat` 拉取 `DeviceInfoDto.permissions`，写 `SetupPrefs.savePermissions` 并 `PermissionsHolder.update`
+   - `MainActivity`：底部 4 页签按 `taskSelect`/`previewStart`/`monitor`/`alarms` 过滤；「高级模式」按钮按 `advanced` 显隐
+
+### 关键凭据（本地调试用）
+
+| 项 | 值 |
+|----|-----|
+| 服务端管理 Token | `cnc-admin-2026`（环境变量 `CNC_ADMIN_TOKEN`） |
+| 客户端管理员密码 | `admin123`（可在后台修改） |
+| 高级模式 PIN | `1234` |
+| 服务端端口 | `8080` |
+
+### 本地接手第一步
+
+1. 确认 JDK 17、Android Studio（SDK Platform 34）已装
+2. 在项目根目录创建 `local.properties`，填入 `sdk.dir=你的AndroidSDK路径`
+3. 运行：`./gradlew :app:assembleDebug test` 验证编译和测试
+4. 启动服务端：`CNC_ADMIN_TOKEN=cnc-admin-2026 ./gradlew -p server installDist && server/build/install/cnc-server/bin/cnc-server`
+5. 浏览器打开 `http://localhost:8080/admin/` 验证后台
+
+### 硬性约束（贯穿项目）
+
+- 必须有真实代码，未实现功能不得标完成
+- 模拟数据必须标 `isSimulated`
+- 急停/限位/运动下发不得依赖服务端在线
+- 自动化流程禁止固定延时；`RESULT_UNKNOWN` 禁止盲目重发
+- 不创建不必要文档文件
