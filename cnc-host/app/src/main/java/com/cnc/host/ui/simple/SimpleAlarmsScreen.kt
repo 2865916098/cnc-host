@@ -290,6 +290,7 @@ private fun severityLabel(severity: AlarmSeverity): String = when (severity) {
 private fun runPhaseLabel(phase: RunPhase): String = when (phase) {
     RunPhase.IDLE -> "就绪"
     RunPhase.RUNNING -> "加工中"
+    RunPhase.PAUSED -> "已暂停"
     RunPhase.COMPLETED -> "已完成"
     RunPhase.FAILED -> "失败"
     RunPhase.STOPPED -> "已停止"
@@ -298,6 +299,7 @@ private fun runPhaseLabel(phase: RunPhase): String = when (phase) {
 
 private fun runPhaseColor(phase: RunPhase): Color = when (phase) {
     RunPhase.RUNNING -> CncColors.Warning
+    RunPhase.PAUSED -> CncColors.Info
     RunPhase.COMPLETED -> CncColors.Success
     RunPhase.FAILED, RunPhase.ESTOPPED -> CncColors.Danger
     RunPhase.STOPPED -> CncColors.Info

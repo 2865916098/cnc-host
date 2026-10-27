@@ -106,7 +106,8 @@ data class DrawingDto(
     val layers: Int = 0,
     val entities: Int = 0,
     val source: String = "SERVER",
-    val dxfContent: String = ""
+    val dxfContent: String = "",
+    val planId: String = ""
 )
 
 data class DrawingCorrectionDto(

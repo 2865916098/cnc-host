@@ -31,7 +31,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         TaskHistoryEntity::class,
         SyncMetaEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -90,6 +90,13 @@ abstract class CncDatabase : RoomDatabase() {
             }
         }
 
+        /** v4 → v5：drawings 表新增 planId（关联工艺方案，简易模式读取切削参数）。 */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE drawings ADD COLUMN planId TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
         @Volatile
         private var INSTANCE: CncDatabase? = null
 
@@ -105,7 +112,7 @@ abstract class CncDatabase : RoomDatabase() {
                 CncDatabase::class.java,
                 DB_NAME
             )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                 .allowMainThreadQueries()           // 开发期允许（ViewModel 里先读）；生产改用 suspend/Flow
                 .build()
         }

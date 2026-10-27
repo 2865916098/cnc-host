@@ -137,10 +137,15 @@ object Db {
                         layers INTEGER NOT NULL,
                         entities INTEGER NOT NULL,
                         source TEXT NOT NULL,
-                        dxfContent TEXT NOT NULL
+                        dxfContent TEXT NOT NULL,
+                        planId TEXT NOT NULL DEFAULT ''
                     )
                     """.trimIndent()
                 )
+                // 兼容旧库：若 planId 列不存在则补上
+                runCatching {
+                    c.createStatement().execute("ALTER TABLE drawings ADD COLUMN planId TEXT NOT NULL DEFAULT ''")
+                }
                 st.executeUpdate(
                     """
                     CREATE TABLE IF NOT EXISTS drawing_corrections(
@@ -595,7 +600,8 @@ object Db {
                             layers = rs.getInt("layers"),
                             entities = rs.getInt("entities"),
                             source = rs.getString("source"),
-                            dxfContent = rs.getString("dxfContent")
+                            dxfContent = rs.getString("dxfContent"),
+                            planId = rs.getString("planId").orEmpty()
                         )
                     )
                 }
@@ -608,8 +614,8 @@ object Db {
         c.tx {
             c.prepareStatement(
                 """
-                INSERT OR REPLACE INTO drawings(id, filename, layers, entities, source, dxfContent)
-                VALUES(?,?,?,?,?,?)
+                INSERT OR REPLACE INTO drawings(id, filename, layers, entities, source, dxfContent, planId)
+                VALUES(?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
@@ -618,6 +624,7 @@ object Db {
                 ps.setInt(4, saved.entities)
                 ps.setString(5, saved.source)
                 ps.setString(6, saved.dxfContent)
+                ps.setString(7, saved.planId)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -1066,13 +1073,14 @@ object Db {
             EOF
         """.trimIndent()
         val drawings = listOf(
-            DrawingConfig("srv-d1", "主轴接套.dxf", 1, 5, "SERVER", dxf),
-            DrawingConfig("srv-d2", "液压阀芯.dxf", 1, 4, "SERVER", dxf)
+            DrawingConfig("srv-d1", "主轴接套.dxf", 1, 5, "SERVER", dxf, planId = "srv-pp1"),
+            DrawingConfig("srv-d2", "液压阀芯.dxf", 1, 4, "SERVER", dxf, planId = "srv-pp2")
         )
         drawings.forEach { d ->
-            c.prepareStatement("INSERT OR REPLACE INTO drawings VALUES(?,?,?,?,?,?)").use { ps ->
+            c.prepareStatement("INSERT OR REPLACE INTO drawings VALUES(?,?,?,?,?,?,?)").use { ps ->
                 ps.setString(1, d.id); ps.setString(2, d.filename); ps.setInt(3, d.layers)
                 ps.setInt(4, d.entities); ps.setString(5, d.source); ps.setString(6, d.dxfContent)
+                ps.setString(7, d.planId)
                 ps.executeUpdate()
             }
         }

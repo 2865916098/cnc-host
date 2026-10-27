@@ -119,6 +119,9 @@ data class DrawingEntity(
     /** 导入时保存的 DXF 原文，供后续重新加载到 CAM；内置示例为空串。 */
     @ColumnInfo(defaultValue = "")
     val dxfContent: String = "",
+    /** 关联的工艺方案 ID；空串表示未关联，简易模式回退默认参数。 */
+    @ColumnInfo(defaultValue = "")
+    val planId: String = "",
     val createdAt: Long = System.currentTimeMillis()
 )
 

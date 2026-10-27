@@ -53,8 +53,8 @@ object SeedData {
 
     // ===== 图纸索引 =====
     val drawings = listOf(
-        DrawingEntity("d1", "sample-out.dxf", layers = 3, entities = 5, source = "EMBEDDED"),
-        DrawingEntity("d2", "spindle-housing.dxf", layers = 4, entities = 12, source = "EMBEDDED")
+        DrawingEntity("d1", "sample-out.dxf", layers = 3, entities = 5, source = "EMBEDDED", planId = "pp-1"),
+        DrawingEntity("d2", "spindle-housing.dxf", layers = 4, entities = 12, source = "EMBEDDED", planId = "pp-2")
     )
 
     // ===== 任务历史（首次启动时自动写几条） =====
