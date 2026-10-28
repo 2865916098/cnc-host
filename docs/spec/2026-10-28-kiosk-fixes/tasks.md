@@ -26,6 +26,6 @@
 
 ## 收尾
 - [x] T19 gradlew test 全绿（JDK17）
-- [ ] T20 gradlew build 全绿（lint 0 错误）
-- [ ] T21 grep 验证 OutlinedTextField=0；需求总表核查更新
-- [ ] T22 功能分支推送+开 PR；汇报（改动/测试/待真机验收清单）
+- [x] T20 gradlew build 全绿（lint 0 错误）
+- [x] T21 grep 验证 OutlinedTextField=0；需求总表核查更新
+- [x] T22 功能分支推送+开 PR；汇报（改动/测试/待真机验收清单）

@@ -29,9 +29,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         DrawingEntity::class,
         DrawingCorrectionEntity::class,
         TaskHistoryEntity::class,
-        SyncMetaEntity::class
+        SyncMetaEntity::class,
+        com.cnc.host.logging.OperationLogEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -47,6 +48,7 @@ abstract class CncDatabase : RoomDatabase() {
     abstract fun drawingCorrectionDao(): DrawingCorrectionDao
     abstract fun taskHistoryDao(): TaskHistoryDao
     abstract fun syncMetaDao(): SyncMetaDao
+    abstract fun logDao(): com.cnc.host.logging.LogDao
 
     companion object {
         const val DB_NAME = "cnc_host.db"
@@ -90,6 +92,25 @@ abstract class CncDatabase : RoomDatabase() {
             }
         }
 
+        /** v4 → v5：新增 operation_logs 表（本地操作日志缓存）。 */
+        private val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `operation_logs` (" +
+                        "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                        "`timestamp` INTEGER NOT NULL, " +
+                        "`level` TEXT NOT NULL, " +
+                        "`category` TEXT NOT NULL, " +
+                        "`message` TEXT NOT NULL, " +
+                        "`taskId` TEXT, " +
+                        "`details` TEXT, " +
+                        "`uploaded` INTEGER NOT NULL)"
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_operation_logs_uploaded` ON operation_logs(`uploaded`)")
+                db.execSQL("CREATE INDEX IF NOT EXISTS `index_operation_logs_timestamp` ON operation_logs(`timestamp`)")
+            }
+        }
+
         @Volatile
         private var INSTANCE: CncDatabase? = null
 
@@ -105,7 +126,8 @@ abstract class CncDatabase : RoomDatabase() {
                 CncDatabase::class.java,
                 DB_NAME
             )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .fallbackToDestructiveMigration()   // 开发期 schema 变更可接受 destructive 重建
                 .allowMainThreadQueries()           // 开发期允许（ViewModel 里先读）；生产改用 suspend/Flow
                 .build()
         }

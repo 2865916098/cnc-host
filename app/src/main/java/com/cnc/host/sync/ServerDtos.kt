@@ -218,3 +218,18 @@ data class DeviceInfoDto(
 )
 
 data class AdminVerifyRequestDto(val password: String = "")
+
+// ===================== 操作日志 =====================
+
+/** 单条操作日志（客户端 ↔ 服务端）。 */
+data class OperationLogDto(
+    val timestamp: Long,
+    val level: String,
+    val category: String,
+    val message: String,
+    val taskId: String? = null,
+    val details: String? = null
+)
+
+/** 批量上传日志的请求体。 */
+data class UploadLogsRequestDto(val deviceId: String, val logs: List<OperationLogDto>)

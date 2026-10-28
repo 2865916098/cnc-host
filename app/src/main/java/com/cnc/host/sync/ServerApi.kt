@@ -117,6 +117,12 @@ class ServerApi(private val settings: ServerSettings) {
         )
     }
 
+    /** 批量上传操作日志到服务端（bearer("device") 保护）。 */
+    suspend fun uploadLogs(req: UploadLogsRequestDto): Result<Unit> = runCatching {
+        request("POST", "/api/v1/logs", gson.toJson(req))
+        Unit
+    }
+
     private suspend fun request(method: String, path: String, body: String? = null): String =
         withContext(Dispatchers.IO) {
             val base = normalizedBaseUrl()

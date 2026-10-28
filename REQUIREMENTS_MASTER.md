@@ -58,6 +58,9 @@
 | REQ-C11 | 任务菜单连接状态与配置同步修复（2026-10-28 指令 N6） | ✅ | 根因=注册未存 token/deviceId；服务端签发 device_token（注册返回+心跳自愈+老库回填），bearer 三源鉴权；心跳 10s 联动徽标 + config/version 探测变化即全量同步 | 待真机验收 |
 | REQ-C12 | 在线/离线状态实时更新（2026-10-28 指令 N7） | ✅ | 心跳 30s→10s；离线判定 90s→25s；后台设备页 3s 轮询保持 | 待真机验收 |
 | REQ-C13 | 版本发布默认最新 APK 一键发布（2026-10-28 指令 N8） | ✅ | AxmlVersionReader（二进制 AXML 解析 versionCode/versionName）+ ApkScanner 扫描构建目录；/app-latest-candidate + /app-publish-latest；后台「一键发布」按钮，手动上传折叠兜底 | 待验收（服务端跑一遍发布） |
+| REQ-C14 | 屏幕常亮（工业平板加工现场阻塞缺口） | ✅ | MainActivity 加 FLAG_KEEP_SCREEN_ON | 待真机验收 |
+| REQ-C15 | 设备被后台注销后自动回注册（现场运维链路） | ✅ | 心跳收到 404 → 清本地注册+鉴权 → 前台重启回注册流程 | 待真机验收 |
+| REQ-C16 | 操作日志服务端闭环（A15 缺口修复） | ✅ | 服务端 operation_logs 表 + POST/GET/DELETE 三个 API；客户端 Room 本地缓存 + 心跳 10s 自动补传；8 处关键路径埋点（加工启动/完成/急停、心跳、APK 更新、清除数据、应用启动） | 待验收 |
 
 ## D 系列：修改/替换记录【正式/会话混合】
 

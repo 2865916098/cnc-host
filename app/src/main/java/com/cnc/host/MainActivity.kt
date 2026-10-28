@@ -37,6 +37,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.navigation.Screen
 import com.cnc.host.navigation.advancedNavItems
 import com.cnc.host.navigation.simpleNavItems
@@ -120,6 +121,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         // 客户端统一使用内嵌键盘，禁止系统输入法弹出
         window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        // Kiosk 工业平板：加工期间屏幕常亮，避免操作工看不到机床状态（设备接电常驻场景）
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         hideSystemBars()
         setContent {
             CncTheme {
@@ -196,7 +199,10 @@ fun CncHostApp() {
     }
 
     // 进入主应用后加载一次缓存的权限（心跳会持续更新）
-    LaunchedEffect(Unit) { PermissionsHolder.load(context) }
+    LaunchedEffect(Unit) {
+        PermissionsHolder.load(context)
+        LogRecorder.info(context, "SYSTEM", "应用启动，进入主界面")
+    }
 
     val perms by PermissionsHolder.flow.collectAsState()
     val navController = rememberNavController()

@@ -90,6 +90,15 @@ fun Application.cncServerModule(adminToken: String) {
         }
     }
     install(Authentication) {
+        bearer("device") {
+            authenticate { credential ->
+                if (Db.isValidDeviceToken(credential.token)) {
+                    io.ktor.server.auth.UserIdPrincipal("device")
+                } else {
+                    null
+                }
+            }
+        }
         bearer("admin") {
             authenticate { credential ->
                 // 兼容：环境变量管理口令 / 后台登录会话 token / 注册设备的设备令牌
@@ -224,6 +233,17 @@ fun Application.cncServerModule(adminToken: String) {
             }
         }
 
+        // 操作日志：设备批量上传（bearer("device") 保护，心跳自动补传）
+        authenticate("device") {
+            route("/api/v1") {
+                post("/logs") {
+                    val req = call.receive<UploadLogsRequest>()
+                    Db.insertLogs(req.deviceId, req.logs)
+                    call.respond(SimpleResult(ok = true, message = "已接收 ${req.logs.size} 条日志"))
+                }
+            }
+        }
+
         authenticate("admin") {
             route("/api/v1") {
                 get("/auth/check") {
@@ -314,6 +334,20 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 post("/tasks") {
                     call.respond(Db.upsertTask(call.receive<TaskRecord>()))
+                }
+
+                // ===== 操作日志（管理端查询/清理）=====
+                get("/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 500
+                    call.respond(Db.listLogs(deviceId, limit))
+                }
+                delete("/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val olderThanMs = call.request.queryParameters["olderThanMs"]?.toLongOrNull()
+                        ?: (System.currentTimeMillis() - 7L * 24 * 3600 * 1000)
+                    val deleted = Db.deleteLogsOlderThan(deviceId, olderThanMs)
+                    call.respond(SimpleResult(ok = true, message = "已清理 $deleted 条日志"))
                 }
 
                 // ===== 客户端实时状态 =====

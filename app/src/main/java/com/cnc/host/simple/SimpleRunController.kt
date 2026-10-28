@@ -5,6 +5,7 @@ import com.cnc.device.api.CommandStatus
 import com.cnc.device.api.DeviceCommand
 import com.cnc.device.api.DeviceController
 import com.cnc.host.data.DeviceRepository
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.persistence.CncDatabase
 import com.cnc.host.persistence.TaskHistoryEntity
 import com.cnc.host.sync.StatusDto
@@ -75,6 +76,8 @@ object SimpleRunController {
         val app = context.applicationContext
         val startedAt = System.currentTimeMillis()
         val segments = toolpath.segments
+
+        LogRecorder.info(context, "TASK", "加工启动：$taskName，${segments.size} 段刀路", taskId = drawingId)
 
         _state.value = SimpleRunState(
             taskName = taskName,
@@ -219,6 +222,15 @@ object SimpleRunController {
             finishedAt = finishedAt,
             error = if (phase == RunPhase.FAILED) finalMessage else previous.error
         )
+
+        // 记录加工结果日志
+        when (phase) {
+            RunPhase.COMPLETED -> LogRecorder.info(app, "TASK", "加工完成：${previous.taskName}", taskId = previous.drawingId)
+            RunPhase.FAILED -> LogRecorder.error(app, "TASK", "加工失败：${finalMessage}", taskId = previous.drawingId)
+            RunPhase.ESTOPPED -> LogRecorder.error(app, "ALARM", "急停触发，加工中止：${previous.taskName}", taskId = previous.drawingId)
+            RunPhase.STOPPED -> LogRecorder.warn(app, "TASK", "受控停止：${previous.taskName}", taskId = previous.drawingId)
+            else -> {}
+        }
 
         // 停止主轴（失败仅记录日志，不覆盖作业结果）
         runCatching { device.sendMotionCommand(DeviceCommand.setSpindle(

@@ -3,6 +3,7 @@ package com.cnc.host.ui.setup
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.service.KioskService
 import com.cnc.host.setup.SetupPrefs
 import com.cnc.host.sync.ServerAddress
@@ -114,6 +115,7 @@ class KioskSettingsViewModel(application: Application) : AndroidViewModel(applic
      */
     fun resetRegistration() {
         val app = getApplication<Application>()
+        LogRecorder.info(app, "SYSTEM", "用户触发清除数据，准备重新注册")
         SetupPrefs.clearRegistration(app)
         ServerPrefs.clearAuth(app)
         SetupPrefs.setExited(app, false)

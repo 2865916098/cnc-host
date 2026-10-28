@@ -171,6 +171,23 @@ object Db {
                 )
                 st.executeUpdate(
                     """
+                    CREATE TABLE IF NOT EXISTS operation_logs(
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        device_id TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL,
+                        level TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        task_id TEXT,
+                        details TEXT
+                    )
+                    """.trimIndent()
+                )
+                st.executeUpdate(
+                    "CREATE INDEX IF NOT EXISTS idx_op_logs_device ON operation_logs(device_id, timestamp DESC)"
+                )
+                st.executeUpdate(
+                    """
                     CREATE TABLE IF NOT EXISTS devices(
                         id TEXT PRIMARY KEY,
                         unit_name TEXT NOT NULL,
@@ -1272,6 +1289,71 @@ object Db {
                 ps.setLong(7, t.startedAt); ps.setLong(8, t.finishedAt)
                 ps.executeUpdate()
             }
+        }
+    }
+
+    // ===== 操作日志 =====
+
+    /** 批量插入设备上传的操作日志。 */
+    fun insertLogs(deviceId: String, logs: List<OperationLogDto>) = withConn { c ->
+        if (logs.isEmpty()) return@withConn
+        c.prepareStatement(
+            "INSERT INTO operation_logs(device_id, timestamp, level, category, message, task_id, details) VALUES(?,?,?,?,?,?,?)"
+        ).use { ps ->
+            logs.forEach { log ->
+                ps.setString(1, deviceId)
+                ps.setLong(2, log.timestamp)
+                ps.setString(3, log.level)
+                ps.setString(4, log.category)
+                ps.setString(5, log.message)
+                if (log.taskId != null) ps.setString(6, log.taskId) else ps.setNull(6, java.sql.Types.VARCHAR)
+                if (log.details != null) ps.setString(7, log.details) else ps.setNull(7, java.sql.Types.VARCHAR)
+                ps.addBatch()
+            }
+            ps.executeBatch()
+        }
+    }
+
+    /** 查询操作日志；可选按 deviceId 过滤，按 timestamp DESC 返回。 */
+    fun listLogs(deviceId: String? = null, limit: Int = 500): List<OperationLogDto> = withConn { c ->
+        val sql = if (deviceId.isNullOrBlank()) {
+            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs ORDER BY timestamp DESC LIMIT ?"
+        } else {
+            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?"
+        }
+        c.prepareStatement(sql).use { ps ->
+            if (!deviceId.isNullOrBlank()) ps.setString(1, deviceId)
+            ps.setInt(if (deviceId.isNullOrBlank()) 1 else 2, limit)
+            ps.executeQuery().use { rs ->
+                buildList {
+                    while (rs.next()) {
+                        add(
+                            OperationLogDto(
+                                timestamp = rs.getLong("timestamp"),
+                                level = rs.getString("level"),
+                                category = rs.getString("category"),
+                                message = rs.getString("message"),
+                                taskId = rs.getString("task_id"),
+                                details = rs.getString("details")
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** 清理指定设备（或全部）早于 olderThanMs 的日志，返回删除行数。 */
+    fun deleteLogsOlderThan(deviceId: String?, olderThanMs: Long): Int = withConn { c ->
+        val sql = if (deviceId.isNullOrBlank()) {
+            "DELETE FROM operation_logs WHERE timestamp < ?"
+        } else {
+            "DELETE FROM operation_logs WHERE device_id = ? AND timestamp < ?"
+        }
+        c.prepareStatement(sql).use { ps ->
+            if (!deviceId.isNullOrBlank()) ps.setString(1, deviceId)
+            ps.setLong(if (deviceId.isNullOrBlank()) 1 else 2, olderThanMs)
+            ps.executeUpdate()
         }
     }
 }

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.setup.SetupPrefs
 import com.cnc.host.sync.AppVersionDto
 import com.cnc.host.sync.ServerApi
@@ -90,13 +91,16 @@ object AppUpdate {
         val target = File(context.cacheDir, "apk/cnc-host-update.apk")
         _prompt.value = null
         _progress.value = 0
+        LogRecorder.info(context, "SYSTEM", "开始下载更新 ${version.versionName}(${version.versionCode})")
         val result = ServerApi(settings).downloadApk(target) { downloaded, total ->
             _progress.value = if (total > 0) ((downloaded * 100) / total).toInt().coerceIn(0, 100) else 0
         }
         if (result.isFailure) {
             _progress.value = -1
             _prompt.value = version
-            return "下载失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+            val msg = "下载失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+            LogRecorder.error(context, "SYSTEM", msg, details = result.exceptionOrNull()?.stackTraceToString())
+            return msg
         }
         // 校验完整性
         if (version.sha256.isNotBlank()) {
@@ -105,9 +109,11 @@ object AppUpdate {
                 target.delete()
                 _progress.value = -1
                 _prompt.value = version
+                LogRecorder.error(context, "SYSTEM", "安装包 SHA-256 校验失败：期望 ${version.sha256.take(16)}...，实际 ${actual.take(16)}...")
                 return "安装包校验失败，请重试"
             }
         }
+        LogRecorder.info(context, "SYSTEM", "更新下载完成，开始安装 ${version.versionName}(${version.versionCode})")
         _progress.value = -1
         install(context, target)
         return null

@@ -319,3 +319,20 @@ data class AdminLoginResult(
     val username: String = "",
     val expiresAt: Long = 0L
 )
+
+// ===================== 操作日志 =====================
+
+/** 设备上传 / 管理端查询的单条操作日志。 */
+@Serializable
+data class OperationLogDto(
+    val timestamp: Long,
+    val level: String,
+    val category: String,
+    val message: String,
+    val taskId: String? = null,
+    val details: String? = null
+)
+
+/** 设备批量上传日志的请求体。 */
+@Serializable
+data class UploadLogsRequest(val deviceId: String, val logs: List<OperationLogDto>)
