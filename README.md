@@ -1,6 +1,7 @@
 # CNC Host — 两轴数控车床上位机（客户端 + 服务端）
 
 > 完整项目说明见 [项目文档](docs/PROJECT_DOCUMENTATION.md)，服务端接口清单见 [接口文档](docs/API.md)。
+> AI 协作交接（含当前进度、关键决策、二期待办）见 [ChatGPT 交接文档](docs/CHATGPT_HANDOFF.md)。
 
 面向 X/Z 两轴数控车床的加工上位机。采用 C/S 架构：
 
