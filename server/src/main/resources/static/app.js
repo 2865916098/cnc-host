@@ -144,7 +144,8 @@
   // ===== 数据 =====
   async function loadAll() {
     S.config = await api("/api/v1/config");
-    S.tasks = await api("/api/v1/tasks");
+    // R6：无「任务记录」模块权限的账号会拿到 403，容错为空列表避免登录后白屏
+    S.tasks = await api("/api/v1/tasks").catch(() => []);
     S.devices = await api("/api/v1/devices").catch(() => []);
     S.orgSummary = await api("/api/v1/devices/org-summary").catch(() => []);
     S.appVersion = await api("/api/v1/app-version-info").catch(() => null);

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # 根工程：JVM 模块单测 + Android app 单测
+      - name: Root unit tests
+        run: ./gradlew test testDebugUnitTest
+
+      # server 为独立工程，需单独构建测试
+      - name: Server tests
+        run: ./gradlew -p server test
+
+      - name: Assemble debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Lint
+        run: ./gradlew :app:lintDebug

@@ -15,11 +15,9 @@ import com.cnc.gcode.post.fanuc.Fanuc0iPostProcessor
 import com.cnc.host.data.CamResult
 import com.cnc.host.data.CamSession
 import com.cnc.host.data.DeviceRepository
-import com.cnc.model.cam.MotionType
 import com.cnc.model.cam.ProcessStep
 import com.cnc.model.cam.ProcessType
 import com.cnc.model.cam.Toolpath
-import com.cnc.model.drawing.Point2D
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -136,15 +134,9 @@ class ReviewViewModel(
 
             for ((idx, seg) in tp.segments.withIndex()) {
                 if (!isActive) break
-                val target = Point2D(seg.end.x, seg.end.y)
                 val cmdId = "ex-${idx}-${System.currentTimeMillis()}"
-                val cmd = when (seg.motionType) {
-                    MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, null, target)
-                    MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
-                        cmdId, null, target, seg.feedMmPerMin.takeIf { it > 0 } ?: 100.0
-                    )
-                    MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, null, target, 100.0)
-                }
+                // R1 修复：圆弧段按 ARC_FEED 下发；缺圆心时 fromSegment 抛错，拒绝按弦加工
+                val cmd = DeviceCommand.fromSegment(cmdId, null, seg)
 
                 val result = device.sendMotionCommand(cmd)
 

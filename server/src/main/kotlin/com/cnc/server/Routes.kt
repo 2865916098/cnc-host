@@ -17,6 +17,7 @@ import io.ktor.server.auth.bearer
 import io.ktor.server.plugins.callloging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.plugins.origin
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.path
@@ -125,6 +126,12 @@ fun Application.cncServerModule(adminToken: String) {
 
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; prettyPrint = true }
 
+    // R5：敏感开放接口限流（按客户端 IP，进程内滑动窗口，超限返回 429）
+    val loginLimiter = RateLimiter(maxRequests = 5, windowMs = 60_000)
+    val registerLimiter = RateLimiter(maxRequests = 10, windowMs = 60_000)
+    // 正常心跳周期 10 秒（6 次/分钟），限 60 次/分钟留出充足余量
+    val heartbeatLimiter = RateLimiter(maxRequests = 60, windowMs = 60_000)
+
     install(ContentNegotiation) { json(json) }
     install(CallLogging) { level = Level.INFO }
     install(CORS) {
@@ -202,8 +209,15 @@ fun Application.cncServerModule(adminToken: String) {
 
         // 设备注册与心跳（开放接口，注册前客户端尚无管理口令）
         route("/api/v1") {
-            // 管理后台账号密码登录（开放接口）
+            // 管理后台账号密码登录（开放接口，R5：按 IP 限流防爆破）
             post("/admin/login") {
+                if (!loginLimiter.allow(call.request.origin.remoteHost)) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        AdminLoginResult(ok = false, message = "尝试过于频繁，请 1 分钟后再试")
+                    )
+                    return@post
+                }
                 val req = call.receive<AdminLoginRequest>()
                 if (Db.verifyAdminAccount(req.username, req.password)) {
                     // users 表中存在该账号时带出角色/权限；老库回退登录时按超管处理
@@ -229,6 +243,13 @@ fun Application.cncServerModule(adminToken: String) {
                 }
             }
             post("/devices/register") {
+                if (!registerLimiter.allow(call.request.origin.remoteHost)) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        SimpleResult(ok = false, message = "注册请求过于频繁，请稍后再试")
+                    )
+                    return@post
+                }
                 val req = call.receive<RegisterRequest>()
                 // 设备激活：按 hardwareId 幂等（同一硬件重复激活 = 同一台设备）。
                 // 客户端「清除数据」后本地令牌会丢失，若拒绝激活将永久卡死，
@@ -236,13 +257,14 @@ fun Application.cncServerModule(adminToken: String) {
                 val info = Db.registerDevice(req)
                 call.respond(info)
             }
-            get("/devices/{id}") {
-                val id = call.parameters["id"].orEmpty()
-                val info = Db.getDevice(id)
-                if (info != null) call.respond(info)
-                else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
-            }
             post("/devices/{id}/heartbeat") {
+                if (!heartbeatLimiter.allow(call.request.origin.remoteHost)) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        SimpleResult(ok = false, message = "心跳过于频繁，请稍后再试")
+                    )
+                    return@post
+                }
                 val id = call.parameters["id"].orEmpty()
                 val req = runCatching { call.receive<HeartbeatRequest>() }.getOrDefault(HeartbeatRequest())
                 val info = Db.heartbeat(id, req.appVersion)
@@ -295,11 +317,16 @@ fun Application.cncServerModule(adminToken: String) {
                     val token = call.bearerToken()
                     if (token == adminToken) return@intercept
                     if (Db.isValidDeviceToken(token)) {
-                        // 设备令牌权限最小化：仅允许读配置 + 回传任务记录/实时状态，禁止账号管理与写配置
+                        // R6 收紧：设备令牌白名单——仅允许读配置/自检/查本机 + 回传任务记录/实时状态，
+                        // 其余一律 403（含 /logs、/users、设备列表、写配置等）
                         val m = call.request.httpMethod.value
                         val p = call.request.path()
-                        val allowed = (m == "GET" && !p.contains("/users") && !p.contains("/admin-password")) ||
-                            (m == "POST" && (p.endsWith("/tasks") || p.endsWith("/status")))
+                        val deviceSub = p.removePrefix("/api/v1/devices/")
+                        val isSingleDeviceGet = m == "GET" && p.startsWith("/api/v1/devices/") &&
+                            deviceSub.isNotBlank() && !deviceSub.contains("/") && deviceSub != "org-summary"
+                        val allowed = isSingleDeviceGet ||
+                            (m == "GET" && (p == "/api/v1/auth/check" || p == "/api/v1/config" || p.startsWith("/api/v1/config/"))) ||
+                            (m == "POST" && (p == "/api/v1/tasks" || p == "/api/v1/status"))
                         if (!allowed) {
                             call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌仅允许同步配置与回传数据"))
                             finish()
@@ -317,13 +344,8 @@ fun Application.cncServerModule(adminToken: String) {
                     val method = call.request.httpMethod.value
                     val path = call.request.path()
                     val required = requiredPermission(method, path) ?: return@intercept
-                    val allowed = if (method == "GET" && !path.contains("/users")) {
-                        // 只读请求对已登录用户宽松放行（账号管理除外）
-                        user.permissions.isNotEmpty()
-                    } else {
-                        user.permissions.contains(required)
-                    }
-                    if (!allowed) {
+                    // R6 收紧：GET 不再宽松放行，与其它方法一样按模块权限校验
+                    if (!user.permissions.contains(required)) {
                         call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
                         finish()
                     }
@@ -641,6 +663,27 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 get("/devices") {
                     call.respond(Db.listDevices())
+                }
+                // 设备详情：R2 修复——需鉴权；设备令牌仅可查自身；响应剥离 token
+                //（token 仅在注册/心跳响应中下发，避免经此接口泄露）
+                get("/devices/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val token = call.bearerToken()
+                    val isAdmin = token == adminToken || Db.getSessionUser(token) != null
+                    if (!isAdmin) {
+                        val ownerId = Db.deviceIdByToken(token)
+                        if (ownerId == null) {
+                            call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                            return@get
+                        }
+                        if (ownerId != id) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌仅可查询本机信息"))
+                            return@get
+                        }
+                    }
+                    val info = Db.getDevice(id)
+                    if (info != null) call.respond(info.copy(token = ""))
+                    else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
                 }
                 put("/devices/{id}") {
                     val id = call.parameters["id"].orEmpty()

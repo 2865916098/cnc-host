@@ -1136,6 +1136,15 @@ object Db {
         }
     }
 
+    /** 按设备令牌反查设备 id（设备令牌「仅可查询自身」鉴权用）；令牌无效返回 null。 */
+    fun deviceIdByToken(token: String): String? = withConn { c ->
+        if (token.isBlank()) return@withConn null
+        c.prepareStatement("SELECT id FROM devices WHERE device_token = ? AND device_token != '' LIMIT 1").use { ps ->
+            ps.setString(1, token)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+        }
+    }
+
     /** 校验客户端传入的管理员密码。默认密码 123456，可在后台修改。 */
     fun verifyAdminPassword(password: String): Boolean = withConn { c ->
         val stored = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
@@ -1169,6 +1178,27 @@ object Db {
     const val DEFAULT_ADMIN_USERNAME = "admin"
     const val DEFAULT_ADMIN_PASSWORD = "123456"
     private const val LEGACY_DEFAULT_ADMIN_PASSWORD = "admin123"
+
+    /**
+     * R5 安全检查：默认管理口令是否仍在使用。
+     * 满足任一即视为默认口令在用：meta 未改过密码，或任一超管账号仍能用 123456 登录。
+     */
+    fun isDefaultAdminCredentialInUse(): Boolean {
+        // init() 会把默认密码写入 meta，因此按「值仍为默认」判断，而非判空
+        val metaDefault = withConn { c ->
+            val stored = c.getMeta("admin_password")
+            stored == null || stored == DEFAULT_ADMIN_PASSWORD
+        }
+        if (metaDefault) return true
+        val hashes = withConn { c ->
+            c.prepareStatement("SELECT password_hash FROM users WHERE role = 'SUPER_ADMIN'").use { ps ->
+                ps.executeQuery().use { rs ->
+                    buildList { while (rs.next()) add(rs.getString(1)) }
+                }
+            }
+        }
+        return hashes.any { verifyPassword(DEFAULT_ADMIN_PASSWORD, it) }
+    }
 
     // ===== 密码哈希（PBKDF2WithHmacSHA256）=====
 

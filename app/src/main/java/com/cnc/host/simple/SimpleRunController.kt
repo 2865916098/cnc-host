@@ -10,9 +10,7 @@ import com.cnc.host.persistence.CncDatabase
 import com.cnc.host.persistence.TaskHistoryEntity
 import com.cnc.host.sync.StatusDto
 import com.cnc.host.sync.SyncManager
-import com.cnc.model.cam.MotionType
 import com.cnc.model.cam.Toolpath
-import com.cnc.model.drawing.Point2D
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -118,16 +116,9 @@ object SimpleRunController {
 
                 for ((idx, seg) in segments.withIndex()) {
                     if (!isActive) break
-                    val target = Point2D(seg.end.x, seg.end.y)
                     val cmdId = "simple-${drawingId}-${idx}-${System.currentTimeMillis()}"
-                    val cmd = when (seg.motionType) {
-                        MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, drawingId, target)
-                        MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
-                            cmdId, drawingId, target,
-                            seg.feedMmPerMin.takeIf { it > 0.0 } ?: 100.0
-                        )
-                        MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, drawingId, target, 100.0)
-                    }
+                    // R1 修复：圆弧段按 ARC_FEED 下发；缺圆心时 fromSegment 抛错，拒绝按弦加工
+                    val cmd = DeviceCommand.fromSegment(cmdId, drawingId, seg)
 
                     val result = device.sendMotionCommand(cmd)
                     val status = if (result.isSuccess) {
