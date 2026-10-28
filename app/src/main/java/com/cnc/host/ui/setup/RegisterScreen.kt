@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -13,14 +14,17 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -33,6 +37,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -47,10 +52,11 @@ import com.cnc.ui.theme.CncTypography
 import kotlinx.coroutines.delay
 
 /**
- * 引导第 3 步：设备激活。
+ * 引导第 2 步：设备激活。
  *
- * 首次使用时把本机登记到后台：省份、城市（地区）、单位名称、联系人、电话。
- * 激活必须联网；联网信息与表单校验都在本页完成，成功后进入主界面。
+ * 首次使用时把本机登记到后台：所在省份（身份）、城市（地区）、单位名称、联系人、
+ * 电话、服务器地址。激活必须联网；联网信息与表单校验都在本页完成。
+ * 激活成功后先显示绿色对勾成功页，再自动进入权限配置页。
  * 后台据此维护客户资料，并按单位统计终端数量。
  */
 @Composable
@@ -78,11 +84,49 @@ fun ActivationScreen(
         }
     }
 
+    // 激活成功：先展示成功页 1.5 秒，再自动进入下一步
     LaunchedEffect(ui.done) {
-        if (ui.done) onActivated()
+        if (ui.done) {
+            delay(1500)
+            onActivated()
+        }
     }
 
-    if (ui.done) return
+    // 激活成功页：绿色对勾弹性放大出现 + 提示
+    if (ui.done) {
+        var appeared by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) { appeared = true }
+        val checkScale by androidx.compose.animation.core.animateFloatAsState(
+            targetValue = if (appeared) 1f else 0.3f,
+            animationSpec = androidx.compose.animation.core.spring(
+                dampingRatio = androidx.compose.animation.core.Spring.DampingRatioMediumBouncy,
+                stiffness = androidx.compose.animation.core.Spring.StiffnessMedium
+            ),
+            label = "checkScale"
+        )
+        Box(
+            modifier = Modifier.fillMaxSize().background(CncColors.Background),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier
+                        .size(96.dp)
+                        .scale(checkScale)
+                        .background(CncColors.Success.copy(alpha = 0.15f), CircleShape)
+                        .border(3.dp, CncColors.Success, CircleShape),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("✓", style = CncTypography.displayLarge, color = CncColors.Success)
+                }
+                Spacer(Modifier.height(20.dp))
+                Text("激活成功", style = CncTypography.headlineMedium, color = CncColors.Success)
+                Spacer(Modifier.height(8.dp))
+                Text("即将进入权限配置…", style = CncTypography.bodyMedium, color = CncColors.TextSecondary)
+            }
+        }
+        return
+    }
 
     // 已选省份对应的城市列表；未选省份时为空
     val cities = CHINA_PROVINCES.firstOrNull { it.name == ui.province }?.cities.orEmpty()
@@ -94,6 +138,8 @@ fun ActivationScreen(
             .padding(28.dp)
             .verticalScroll(rememberScrollState())
     ) {
+        SetupStepIndicator(currentStep = 1)
+        Spacer(Modifier.height(12.dp))
         Text("设备激活", style = CncTypography.headlineMedium, color = CncColors.TextPrimary)
         Spacer(Modifier.height(8.dp))
         Text(
@@ -122,9 +168,9 @@ fun ActivationScreen(
         }
         Spacer(Modifier.height(16.dp))
 
-        // 省份 → 城市（地区）
+        // 所在省份（身份）→ 城市（地区）
         SelectorField(
-            label = "省份",
+            label = "所在省份",
             value = ui.province,
             placeholder = "请选择省份",
             enabled = !ui.loading,
@@ -180,7 +226,7 @@ fun ActivationScreen(
             value = ui.serverAddress,
             onValueChange = viewModel::setServerAddress,
             label = { Text("服务器地址（只填 IP）") },
-            placeholder = { Text("例如 192.168.28.18") },
+            placeholder = { Text("例如 192.168.1.100") },
             singleLine = true,
             enabled = !ui.loading,
             modifier = Modifier.fillMaxWidth()
@@ -216,7 +262,19 @@ fun ActivationScreen(
             enabled = !ui.loading,
             modifier = Modifier.fillMaxWidth().height(56.dp),
             colors = ButtonDefaults.buttonColors(containerColor = CncColors.Success)
-        ) { Text(if (ui.loading) "正在激活…" else "激活设备", style = CncTypography.titleMedium) }
+        ) {
+            if (ui.loading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(22.dp),
+                    color = CncColors.TextPrimary,
+                    strokeWidth = 2.dp
+                )
+                Spacer(Modifier.width(10.dp))
+                Text("正在激活…", style = CncTypography.titleMedium)
+            } else {
+                Text("激活设备", style = CncTypography.titleMedium)
+            }
+        }
 
         if (ui.networkRequired) {
             Spacer(Modifier.height(10.dp))

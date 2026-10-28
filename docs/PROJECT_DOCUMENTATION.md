@@ -190,13 +190,13 @@ cnc-host-git-baseline/
 
 ### 5.2 首次启动引导
 
-首次启动由 `MainActivity` 读取 `SetupPrefs.load(context).setupCompleted` 决定是否进入引导；引导分 **3 步**（`setupStep` 0/1/2）：
+首次启动由 `MainActivity` 读取 `SetupPrefs.load(context).setupCompleted` 决定是否进入引导。未激活设备先进入科技感 Splash 页（`SplashScreen`：旋转双环 + 呼吸脉冲 + 扫描线动画，「开始激活」入口，2 秒自动进入），随后引导分 **3 步**（顶部步骤条 `SetupStepIndicator` 实时标识进度）：
 
 | 步骤 | 页面 | 内容 | 是否可跳过 |
 |---|---|---|---|
-| 第 1 步：网络 | `NetworkSetupScreen` + `WifiSetup` | 显示联网状态；扫描附近 WiFi；在 App 内通过 `WifiNetworkSpecifier` 输入密码连接；WiFi 关闭时调起系统 WiFi 面板（浮层，不离开应用）；也可使用移动数据/有线网络 | 是（已联网直接下一步） |
-| 第 2 步：权限与自启 | `PermissionsSetupScreen` + `KioskPermissions` | 三项系统授权：悬浮窗/后台弹出界面、忽略电池优化、厂商「开机自启」设置页（小米/OPPO/vivo/华为/荣耀分别跳转，底部兜底应用详情页）；从系统页返回时自动刷新状态 | 是（不授权只降低保活强度） |
-| 第 3 步：激活 | `RegisterScreen` + `RegisterViewModel` | 省份、城市（地区）、单位名称、联系人、电话、服务器地址；提交后调用 `POST /api/v1/devices/register` | 否（必填省份/城市/单位/联系人/电话） |
+| 第 1 步：网络 | `NetworkSetupScreen` + `WifiSetup` | 顶部实时显示联网状态（2 秒轮询）；「连接 WiFi / 使用移动数据」选项卡：WiFi 页扫描附近热点、App 内输密码连接，移动数据页可跳转系统数据开关；**未联网时不显示「下一步」** | 是（已联网直接下一步） |
+| 第 2 步：激活 | `RegisterScreen` + `RegisterViewModel` | 省份、城市（地区）、单位名称、联系人、电话、服务器地址；提交后调用 `POST /api/v1/devices/register`；成功后绿色对勾动画并自动进入下一步 | 否（必填省份/城市/单位/联系人/电话） |
+| 第 3 步：权限确认 | `PermissionsSetupScreen` + `KioskPermissions` | 确认三项配置：悬浮窗/后台弹出界面、忽略电池优化、厂商「开机自启」（配合看门狗与崩溃自动重启，保证软件始终在运行、不可退出到安卓桌面）；从系统页返回时自动刷新状态 | 是（不授权只降低保活强度） |
 
 **服务器地址规则**
 
@@ -265,9 +265,16 @@ cnc-host-git-baseline/
 
 - `MainActivity.onCreate()` 设置 `SOFT_INPUT_STATE_ALWAYS_HIDDEN`，全局不弹系统输入法。
 - `ui/components/KioskKeyboard.kt` 提供 `KioskTextField`：渲染为只读输入框，点击后弹出应用内 `KioskKeyboardDialog`。
-- 键盘含数字页（1–9、0、`.`、`-`、`:`、`_`、`@`、退格、清空、完成）与 QWERTY 字母页（大小写切换、空格、123 切换）。
-- `keyboardType` 为 `Number/NumberPassword/Decimal/Phone` 时默认数字页；密码框回显与面板均以 `•` 掩码。
+- 键盘四个页面可互相切换：
+  - **26 键拼音**（默认文本页）：QWERTY 全拼，顶部高亮拼音串 + 横向滚动候选栏（最多 9 个，点击上屏 / 空格提交首选）。
+  - **9 键拼音（T9）**：3×3 数字键（数字 + 小号字母），同一数字串的多个音节候选交错排列（如 64 → 米、你、密、尼……）；`1` 轮换输入常用标点，`0` 为空格/提交首选。
+  - **英文页**：QWERTY + 大小写切换 + 符号页。
+  - **数字页**：0–9、`.`、`-`、`:`、`_`、`@`，带「返回」（放弃收起）与「完成」（提交收起）。
+- 拼音引擎为 `ui/components/PinyinEngine.kt` + 词库 `assets/pinyin_dict.txt`（约 7 千词条，含加工中心、刀具补偿等工业词汇）；26 键走哈希精确匹配 + 前缀模糊补全，T9 走数字串索引，首次打开键盘时在 IO 线程加载（<50ms）。
+- 键盘面板高度限定为屏幕高度的 94%，按键行用 weight 均分，横屏平板 9 键 5 行布局不会溢出。
+- `keyboardType` 为 `Number/NumberPassword/Decimal/Phone` 时默认数字页；`Ascii/Password/Uri/Email` 默认英文页；密码框回显与面板均以 `•` 掩码。
 - 当前客户端共 20 处 `KioskTextField` 调用（另有 1 处为其函数声明），覆盖激活、登录密码、IP、参数等输入。
+- 手写识别未内置：需要额外集成手写模型（APK 增大约 10–50MB），如有需要可作为二期需求。
 
 **用法（关键签名）**
 
@@ -662,7 +669,7 @@ server\build\install\cnc-server\bin\cnc-server.bat
 |---|---|
 | 安装 APK | 允许「安装未知来源应用」，安装 `app-debug.apk` |
 | 屏幕 | 固定横屏；建议关闭自动旋转 |
-| 首次启动 | 按引导完成网络 → 权限 → 激活 |
+| 首次启动 | 按引导完成网络 → 激活 → 权限确认 |
 | 悬浮窗/后台弹出 | 在系统设置中允许本应用（小米等 ROM 必须） |
 | 忽略电池优化 | 在系统设置中允许 |
 | 厂商开机自启 | 在厂商安全中心手动打开（**无法由 App 静默完成**） |
@@ -707,7 +714,7 @@ server\build\install\cnc-server\bin\cnc-server.bat
 | 同步 | 本地任务失败排队（上限 100 条）与补传 | ✅ | `SyncManager` |
 | 日志 | Room 本地缓存 + 心跳批量补传 + 服务端 `operation_logs` | ✅ | `LogRecorder`、`DeviceHeartbeat`、`Routes` |
 | 更新 | 版本检测、下载、SHA-256 校验、FileProvider 安装 | 🔶 | `AppUpdate`；无签名验签 |
-| 输入 | 内嵌数字/QWERTY 键盘，全局禁系统 IME | ✅ | `KioskKeyboard.kt`、`MainActivity` |
+| 输入 | 内嵌 26键/9键拼音 + 英文 + 数字键盘（数字页带返回/确认），全局禁系统 IME | ✅ | `KioskKeyboard.kt`、`PinyinEngine.kt`、`MainActivity` |
 | 后台 | 设备列表（含地区）/在线状态/版本/修改/注销/权限 | ✅ | 后台「设备管理」、`/api/v1/devices` |
 | 后台 | 单位终端统计（按单位+省份+城市汇总设备数/在线数/最近心跳） | ✅ | `GET /api/v1/devices/org-summary`、后台「设备管理」 |
 | 后台 | 用户与角色/模块权限管理、禁用、重置密码 | ✅ | `users` 表、7 个用户 API、后台「用户管理」 |

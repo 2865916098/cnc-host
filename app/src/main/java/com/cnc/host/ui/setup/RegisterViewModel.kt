@@ -32,6 +32,9 @@ fun hardwareId(context: Context): String =
 /** 电话只允许 10–13 位纯数字。 */
 private val PHONE_REGEX = Regex("^\\d{10,13}$")
 
+/** 无任何历史/检测到的服务器时预填的默认服务器地址（对应 http://192.168.1.100:8080）。 */
+private const val DEFAULT_SERVER_IP = "192.168.1.100"
+
 /** 激活表单各字段的校验错误，null 表示该字段通过。 */
 data class RegisterFieldErrors(
     val province: String? = null,
@@ -80,9 +83,10 @@ class RegisterViewModel(application: Application) : AndroidViewModel(application
     val ui: StateFlow<RegisterUiState> = _ui.asStateFlow()
 
     init {
-        // 默认使用上次保存的服务器地址；首次安装时自动搜索局域网内的服务端
+        // 默认使用上次保存的服务器地址；没有历史地址时预填默认服务器地址，
+        // 同时继续在局域网内自动搜索服务端，搜到后覆盖默认值
         val saved = SetupPrefs.load(application).serverAddress.ifBlank { ServerPrefs.load(application).baseUrl }
-        _ui.update { it.copy(serverAddress = saved) }
+        _ui.update { it.copy(serverAddress = saved.ifBlank { DEFAULT_SERVER_IP }) }
         if (saved.isBlank()) discoverServer()
     }
 
@@ -125,8 +129,11 @@ class RegisterViewModel(application: Application) : AndroidViewModel(application
             _ui.update {
                 if (found != null) {
                     it.copy(discovering = false, serverAddress = found)
-                } else {
+                } else if (it.serverAddress.isBlank()) {
                     it.copy(discovering = false, error = "未在局域网内找到服务器，请手动输入服务器 IP")
+                } else {
+                    // 已有默认/手填地址：搜索失败不打扰，沿用现有地址
+                    it.copy(discovering = false)
                 }
             }
         }

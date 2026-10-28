@@ -71,6 +71,7 @@ import com.cnc.host.ui.settings.SettingsScreen
 import com.cnc.host.ui.setup.KioskSettingsOverlay
 import com.cnc.host.ui.setup.NetworkSetupScreen
 import com.cnc.host.ui.setup.PermissionsSetupScreen
+import com.cnc.host.ui.setup.SplashScreen
 import com.cnc.host.ui.setup.ActivationScreen
 import com.cnc.host.ui.simple.SimpleAlarmsScreen
 import com.cnc.host.ui.simple.SimpleMonitorScreen
@@ -183,21 +184,28 @@ fun CncHostApp() {
         mutableStateOf(SetupPrefs.load(context).setupCompleted)
     }
 
-    // 首次启动引导流程：0=网络配置，1=权限与自启，2=设备激活
+    // 首次启动引导流程：Splash → 0=网络配置 → 1=设备激活 → 2=权限配置 → 主界面
+    var showSplash by rememberSaveable { mutableStateOf(!setupCompleted) }
     var setupStep by rememberSaveable { mutableIntStateOf(0) }
 
     if (!setupCompleted) {
+        if (showSplash) {
+            // 科技感启动页：2 秒自动或点击「开始激活」进入引导
+            SplashScreen(onEnter = { showSplash = false })
+            return
+        }
         when (setupStep) {
             0 -> NetworkSetupScreen(onNext = { setupStep = 1 })
-            1 -> PermissionsSetupScreen(onNext = { setupStep = 2 })
-            else -> ActivationScreen(
-                onActivated = {
-                    setupCompleted = true
-                    PermissionsHolder.load(context)
-                },
+            1 -> ActivationScreen(
+                // 激活成功动画播完后进入权限配置页
+                onActivated = { setupStep = 2 },
                 // 激活时检测到未联网：回到第 0 步重新配置网络
                 onGoToNetwork = { setupStep = 0 }
             )
+            else -> PermissionsSetupScreen(onNext = {
+                setupCompleted = true
+                PermissionsHolder.load(context)
+            })
         }
         return
     }
