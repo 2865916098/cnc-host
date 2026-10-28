@@ -3,7 +3,7 @@
 - 文档版本：v1.0
 - 生成日期：2026-10-28
 - 代码基线：`cnc-host-git-baseline`（`server/src/main/kotlin/com/cnc/server/Routes.kt`、`Models.kt`、`Main.kt`、`ApkPublish.kt`）
-- 接口总量：**共 50 个 HTTP 接口 + 1 个 WebSocket**
+- 接口总量：**共 51 个 HTTP 接口 + 1 个 WebSocket**
 
 > 本文档全部内容来自服务端真实代码。字段名、默认值、错误码、拦截规则均与代码一一对应；静态资源 `/admin`（网页管理后台）不计入接口数量。
 
@@ -122,7 +122,7 @@ CORS 已开启（`anyHost()`），允许请求头 `Authorization`、`Content-Typ
 
 ---
 
-## 接口总览（50 个 HTTP）
+## 接口总览（51 个 HTTP）
 
 | # | 方法 | 路径 | 鉴权 |
 | --- | --- | --- | --- |
@@ -166,16 +166,17 @@ CORS 已开启（`anyHost()`），允许请求头 `Authorization`、`Content-Typ
 | 38 | GET | `/api/v1/logs` | bearer admin |
 | 39 | DELETE | `/api/v1/logs` | bearer admin |
 | 40 | GET | `/api/v1/devices` | bearer admin |
-| 41 | PUT | `/api/v1/devices/{id}` | bearer admin |
-| 42 | DELETE | `/api/v1/devices/{id}` | bearer admin |
-| 43 | PUT | `/api/v1/devices/{id}/permissions` | bearer admin |
-| 44 | GET | `/api/v1/app-version-info` | bearer admin |
-| 45 | POST | `/api/v1/app-publish` | bearer admin |
-| 46 | GET | `/api/v1/app-latest-candidate` | bearer admin |
-| 47 | POST | `/api/v1/app-publish-latest` | bearer admin |
-| 48 | GET | `/api/v1/status` | bearer admin |
-| 49 | POST | `/api/v1/status` | bearer admin |
-| 50 | POST | `/api/v1/admin-password` | bearer admin |
+| 41 | GET | `/api/v1/devices/org-summary` | bearer admin |
+| 42 | PUT | `/api/v1/devices/{id}` | bearer admin |
+| 43 | DELETE | `/api/v1/devices/{id}` | bearer admin |
+| 44 | PUT | `/api/v1/devices/{id}/permissions` | bearer admin |
+| 45 | GET | `/api/v1/app-version-info` | bearer admin |
+| 46 | POST | `/api/v1/app-publish` | bearer admin |
+| 47 | GET | `/api/v1/app-latest-candidate` | bearer admin |
+| 48 | POST | `/api/v1/app-publish-latest` | bearer admin |
+| 49 | GET | `/api/v1/status` | bearer admin |
+| 50 | POST | `/api/v1/status` | bearer admin |
+| 51 | POST | `/api/v1/admin-password` | bearer admin |
 
 另有 1 个 WebSocket：`/ws/status`。
 
@@ -264,10 +265,10 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
   -d '{"username":"admin","password":"123456"}'
 ```
 
-### 1.4 POST /api/v1/devices/register
+### 1.4 POST /api/v1/devices/register（设备激活）
 
-- 鉴权：无（注册前客户端尚无任何凭据）
-- 说明：注册设备并签发设备令牌。`hardwareId` 非空时，若已存在同硬件标识的设备则返回 409，必须先由后台注销（`DELETE /api/v1/devices/{id}`）才能重新注册。注册成功即写入 `last_seen = 当前时间`、`online = 1`。
+- 鉴权：无（激活前客户端尚无任何凭据）
+- 说明：设备激活（注册）并签发设备令牌。**按 `hardwareId` 幂等**：同一硬件标识重复激活时，更新单位/联系人/电话/地区/服务端地址/版本并返回 200，**保留原 `id`、`registeredAt` 与设备令牌**；不再返回 409（客户端清除数据后本地令牌丢失，若拒绝会导致设备永久无法使用）。`hardwareId` 为空时按新建记录处理。激活成功即写入 `last_seen = 当前时间`、`online = 1`。
 - 请求体 `RegisterRequest`：
 
 | 字段 | 类型 | 必填 | 说明 |
@@ -275,9 +276,11 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
 | unitName | String | 否 | 单位名称，默认 `""` |
 | contactName | String | 否 | 联系人，默认 `""` |
 | phone | String | 否 | 电话，默认 `""` |
+| province | String | 否 | 省份（如 `江苏省`），默认 `""`；客户端激活时必填 |
+| city | String | 否 | 城市（如 `苏州市`），默认 `""`；客户端激活时必填 |
 | serverAddress | String | 否 | 客户端记录的服务端地址，默认 `""` |
-| deviceId | String | 否 | 设备 ID；为空时服务端生成 `dev-<8位>`。**同一 id 再次注册会覆盖原设备记录并签发新令牌** |
-| hardwareId | String | 否 | 硬件唯一标识（Android ID），用于"同一台设备只能注册一次"判定；为空则不查重 |
+| deviceId | String | 否 | 设备 ID；为空时服务端生成 `dev-<8位>`。`hardwareId` 为空时，同一 id 再次激活会覆盖原设备记录并签发新令牌 |
+| hardwareId | String | 否 | 硬件唯一标识（Android ID），**激活按此幂等**；为空则不查重 |
 | appVersion | String | 否 | 客户端版本号，如 `1.1.0`，默认 `""` |
 
 ```json
@@ -285,6 +288,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
   "unitName": "一号车间",
   "contactName": "张三",
   "phone": "13800000000",
+  "province": "江苏省",
+  "city": "苏州市",
   "serverAddress": "http://192.168.1.10:8080",
   "deviceId": "tablet-1",
   "hardwareId": "a1b2c3d4e5f6",
@@ -298,6 +303,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
 | --- | --- | --- |
 | id | String | 设备 ID |
 | unitName | String | 单位名称 |
+| province | String | 省份 |
+| city | String | 城市 |
 | contactName | String | 联系人 |
 | phone | String | 电话 |
 | serverAddress | String | 服务端地址（回显请求值） |
@@ -311,6 +318,8 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
 {
   "id": "tablet-1",
   "unitName": "一号车间",
+  "province": "江苏省",
+  "city": "苏州市",
   "contactName": "张三",
   "phone": "13800000000",
   "serverAddress": "http://192.168.1.10:8080",
@@ -342,15 +351,14 @@ curl -X POST http://127.0.0.1:8080/api/v1/admin/login \
 | io | Boolean | IO 控制 |
 | history | Boolean | 历史记录 |
 
-- 错误码：
-  - 409：`设备已注册，如需重新注册请联系管理员`（`hardwareId` 命中已有设备，或并发唯一索引冲突）。
+- 错误码：无业务错误码；同一 `hardwareId` 重复激活按幂等更新返回 200，不再返回 409。
 
 - curl：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/v1/devices/register \
   -H "Content-Type: application/json" \
-  -d '{"unitName":"一号车间","contactName":"张三","phone":"13800000000","deviceId":"tablet-1","hardwareId":"a1b2c3d4e5f6","appVersion":"1.1.0"}'
+  -d '{"unitName":"一号车间","contactName":"张三","phone":"13800000000","province":"江苏省","city":"苏州市","deviceId":"tablet-1","hardwareId":"a1b2c3d4e5f6","appVersion":"1.1.0"}'
 ```
 
 ### 1.5 GET /api/v1/devices/{id}
@@ -362,12 +370,14 @@ curl -X POST http://127.0.0.1:8080/api/v1/devices/register \
 | --- | --- | --- | --- |
 | id | String | 是 | 设备 ID |
 
-- 响应 200 `DeviceInfo`（字段同 1.4）。`online` 按 `lastSeen` 实时计算：25 秒内有心跳为 `true`。
+- 响应 200 `DeviceInfo`（字段同 1.4，含 `province`、`city`）。`online` 按 `lastSeen` 实时计算：25 秒内有心跳为 `true`。
 
 ```json
 {
   "id": "tablet-1",
   "unitName": "一号车间",
+  "province": "江苏省",
+  "city": "苏州市",
   "contactName": "张三",
   "phone": "13800000000",
   "serverAddress": "http://192.168.1.10:8080",
@@ -1323,7 +1333,7 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 
 #### 3.10.1 GET /api/v1/devices
 
-- 说明：设备注册列表，按注册时间倒序，含在线状态与客户端版本号。
+- 说明：设备激活列表，按注册时间倒序，含在线状态与客户端版本号。
 - 所需模块：`devices`
 - 响应 200 `List<DeviceListItem>`：
 
@@ -1331,6 +1341,8 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 | --- | --- | --- |
 | id | String | 设备 ID |
 | unitName | String | 单位名称 |
+| province | String | 省份 |
+| city | String | 城市 |
 | contactName | String | 联系人 |
 | phone | String | 电话 |
 | serverAddress | String | 服务端地址 |
@@ -1345,6 +1357,8 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
   {
     "id": "tablet-1",
     "unitName": "一号车间",
+    "province": "江苏省",
+    "city": "苏州市",
     "contactName": "张三",
     "phone": "13800000000",
     "serverAddress": "http://192.168.1.10:8080",
@@ -1363,9 +1377,45 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 
 - 错误码：401；403。
 
-#### 3.10.2 PUT /api/v1/devices/{id}
+#### 3.10.2 GET /api/v1/devices/org-summary
 
-- 说明：修改设备单位/联系人/电话。三个字段任一为空（`isBlank()`）返回 400。
+- 说明：单位终端统计。按「单位名称 + 省份 + 城市」分组，统计每组设备数与在线数，按 `deviceCount` 降序返回。服务端将该路由注册在 `/devices/{id}` 之前，避免 `org-summary` 被当作设备 ID。
+- 所需模块：`devices`
+- 响应 200 `List<OrgSummaryItem>`：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| orgName | String | 单位名称（`devices.unit_name`） |
+| province | String | 省份 |
+| city | String | 城市 |
+| deviceCount | Int | 该组设备总数 |
+| onlineCount | Int | 该组在线设备数（25 秒内有过心跳） |
+| lastSeen | Long | 该组最近一次心跳时间（毫秒）；无记录为 0 |
+
+```json
+[
+  {
+    "orgName": "苏州精工机械有限公司",
+    "province": "江苏省",
+    "city": "苏州市",
+    "deviceCount": 3,
+    "onlineCount": 2,
+    "lastSeen": 1793197850745
+  }
+]
+```
+
+- 错误码：401；403。
+- curl：
+
+```bash
+curl http://127.0.0.1:8080/api/v1/devices/org-summary \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+#### 3.10.3 PUT /api/v1/devices/{id}
+
+- 说明：修改设备单位/联系人/电话/地区。该接口为**全量更新**：`unitName`、`contactName`、`phone` 任一为空（`isBlank()`）返回 400；`province`、`city` 可省略（按空串落库）。
 - 路径参数：`id`（String，必填，设备 ID）。
 - 所需模块：`devices`
 - 请求体 `DeviceUpdateRequest`：
@@ -1375,8 +1425,10 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 | unitName | String | 是 | 单位名称，不能为空白 |
 | contactName | String | 是 | 联系人，不能为空白 |
 | phone | String | 是 | 电话，不能为空白 |
+| province | String | 否 | 省份，默认 `""` |
+| city | String | 否 | 城市，默认 `""` |
 
-- 响应 200 `SimpleResult`：
+- 响应 200 `SimpleResult`（简单结果，**不返回完整设备对象**）：
 
 ```json
 { "ok": true, "message": "设备信息已更新", "id": "" }
@@ -1385,7 +1437,7 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 设备不存在时仍为 200，`ok=false`、`message="设备不存在"`。
 - 错误码：400 `单位、联系人、电话不能为空`；401；403。
 
-#### 3.10.3 DELETE /api/v1/devices/{id}
+#### 3.10.4 DELETE /api/v1/devices/{id}
 
 - 说明：注销设备（删除记录），注销后该设备可重新注册。
 - 路径参数：`id`（String，必填）。
@@ -1399,7 +1451,7 @@ curl -X PUT http://127.0.0.1:8080/api/v1/device \
 设备不存在时仍为 200，`ok=false`、`message="设备不存在"`。
 - 错误码：401；403。
 
-#### 3.10.4 PUT /api/v1/devices/{id}/permissions
+#### 3.10.5 PUT /api/v1/devices/{id}/permissions
 
 - 说明：更新设备功能权限开关（整体覆盖）。请求中缺失的 `ClientPermissions` 字段按默认 `true` 处理。
 - 路径参数：`id`（String，必填）。
@@ -1753,7 +1805,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/status \
 | 401 | 未认证 / 登录失效 | 未携带或无效 Bearer；会话过期；账号被禁用或删除（`登录已失效`）；登录账号或密码错误（返回 `AdminLoginResult`） | `SimpleResult`（未通过认证层时为空响应体）；登录失败为 `AdminLoginResult` |
 | 403 | 已认证但无权限 | `无权限执行该操作`（缺模块权限、非超管操作超管）；`设备令牌仅允许同步配置与回传数据`；`设备令牌无权访问账号管理` | `SimpleResult` |
 | 404 | 资源不存在 | 设备不存在/已注销、用户不存在、尚未发布版本、未找到可用 APK 构建产物 | `SimpleResult` |
-| 409 | 冲突 | `设备已注册，如需重新注册请联系管理员`、`用户名已存在` | `SimpleResult` |
+| 409 | 冲突 | `用户名已存在`（设备重复激活已改为幂等更新，不再返回 409） | `SimpleResult` |
 | 500 | 服务端异常 | 未捕获异常；由 `StatusPages` 统一返回 `ok=false` + 异常信息 | `SimpleResult` |
 
 补充规则（与代码一致，实施时需注意）：
@@ -1780,6 +1832,7 @@ curl -X POST http://127.0.0.1:8080/api/v1/status \
 | `POST /admin-password` | `users` | 不可 | 需含 `users` | 可 |
 | `PUT /device` | `device` | 不可 | 需含 `device` | 可 |
 | `GET /devices`、`GET /tasks`、`GET /logs`（只读；刀具/材料/零件/毛坯/方案/图纸无独立 GET 接口，统一走 `GET /config`） | 对应模块（`devices`/`tasks`/`logs`） | 可（GET 放行） | 需 `permissions` 非空（不要求包含对应模块） | 可 |
+| `GET /devices/org-summary` | `devices` | 可（GET 放行） | 需 `permissions` 非空（不要求包含对应模块） | 可 |
 | `POST/DELETE` 刀具、材料、零件、毛坯、方案、图纸、校正、设备写操作 | 对应模块（`tools`/`materials`/`parts`/`plans`/`drawings`/`devices`） | 不可（403） | 需含对应模块 | 可 |
 | `POST /tasks` | `tasks` | 可（POST 以 `/tasks` 结尾） | 需含 `tasks` | 可 |
 | `DELETE /logs` | `logs` | 不可（DELETE） | 需含 `logs` | 可 |
@@ -1798,15 +1851,15 @@ curl -X POST http://127.0.0.1:8080/api/v1/status \
 
 以下示例以 `BASE=http://127.0.0.1:8080`、管理口令 `cnc-admin-2026` 为例。
 
-### 7.1 设备注册 → 心跳 → 拉配置 → 回传任务
+### 7.1 设备激活 → 心跳 → 拉配置 → 回传任务
 
 ```bash
 BASE=http://127.0.0.1:8080
 
-# 1) 注册设备（开放接口），拿到设备令牌
+# 1) 激活设备（开放接口），拿到设备令牌；同一 hardwareId 重复激活为幂等更新，保留原 id 与令牌
 curl -X POST $BASE/api/v1/devices/register \
   -H "Content-Type: application/json" \
-  -d '{"unitName":"一号车间","contactName":"张三","phone":"13800000000","serverAddress":"http://127.0.0.1:8080","deviceId":"tablet-1","hardwareId":"a1b2c3d4e5f6","appVersion":"1.1.0"}'
+  -d '{"unitName":"一号车间","contactName":"张三","phone":"13800000000","province":"江苏省","city":"苏州市","serverAddress":"http://127.0.0.1:8080","deviceId":"tablet-1","hardwareId":"a1b2c3d4e5f6","appVersion":"1.1.0"}'
 
 # 2) 心跳（携带新版本号，同时会回带令牌）
 DEV_TOKEN=<上一步返回的 token>

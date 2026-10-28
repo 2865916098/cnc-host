@@ -86,7 +86,7 @@ fun ServerSyncScreen(
             KioskTextField(
                 value = ui.token,
                 onValueChange = viewModel::setToken,
-                label = { Text("设备令牌/管理口令（注册后自动填充）") },
+                label = { Text("设备令牌/管理口令（激活后自动填充）") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )

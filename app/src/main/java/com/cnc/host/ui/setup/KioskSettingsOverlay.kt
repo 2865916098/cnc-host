@@ -124,10 +124,10 @@ fun KioskSettingsOverlay(
                 OutlinedButton(
                     onClick = { showResetConfirm = true },
                     modifier = Modifier.fillMaxWidth().height(52.dp)
-                ) { Text("清除数据重新注册", style = CncTypography.titleMedium, color = CncColors.Warning) }
+                ) { Text("清除数据重新激活", style = CncTypography.titleMedium, color = CncColors.Warning) }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "清除本机注册信息并重启进入注册流程。若后台仍保留该设备记录，重新注册会被拒绝，需管理员在后台先「注销」。",
+                    "清除本机激活信息并重启进入激活流程。后台仍保留该设备记录，重新激活后会沿用原有登记信息。",
                     style = CncTypography.labelSmall,
                     color = CncColors.TextSecondary
                 )
@@ -155,10 +155,10 @@ fun KioskSettingsOverlay(
         AlertDialog(
             onDismissRequest = { showResetConfirm = false },
             containerColor = CncColors.Surface,
-            title = { Text("清除数据重新注册？", color = CncColors.TextPrimary) },
+            title = { Text("清除数据重新激活？", color = CncColors.TextPrimary) },
             text = {
                 Text(
-                    "将清除本机的注册信息并自动重启软件，回到配网与注册流程。若后台仍有该设备记录，重新注册时会提示「设备已注册」，需管理员在后台注销后才能成功。",
+                    "将清除本机的激活信息并自动重启软件，回到配网与激活流程。重新激活时后台会沿用该设备的原有登记信息。",
                     color = CncColors.TextSecondary
                 )
             },

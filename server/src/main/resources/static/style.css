@@ -184,3 +184,13 @@ td.actions { white-space: nowrap; }
 .user-flag { color: #8dc0ff; font-size: 11px; margin-left: 4px; }
 button:disabled { opacity: .45; cursor: not-allowed; }
 button:disabled:hover { border-color: var(--border); }
+
+/* 设备管理：单位终端统计 */
+.org-summary { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.org-summary.scroll { max-height: 340px; overflow-y: auto; }
+.org-summary .grid thead th { position: sticky; top: 0; z-index: 1; }
+.org-badge {
+  display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--muted); background: var(--panel-2);
+}
+.org-badge.on { color: var(--green); border-color: rgba(46,204,113,.4); background: rgba(46,204,113,.08); }

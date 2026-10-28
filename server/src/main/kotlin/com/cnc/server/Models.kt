@@ -208,15 +208,17 @@ data class ClientPermissions(
     val history: Boolean = true
 )
 
-/** 客户端注册请求。注册前无需管理口令。 */
+/** 客户端注册（设备激活）请求。激活前无需管理口令。 */
 @Serializable
 data class RegisterRequest(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    val province: String = "",
+    val city: String = "",
     val serverAddress: String = "",
     val deviceId: String = "",
-    /** 硬件唯一标识（Android ID），用于保证同一台设备只能注册一次。 */
+    /** 硬件唯一标识（Android ID），激活按此标识幂等。 */
     val hardwareId: String = "",
     /** 客户端版本号，如 1.1.0。 */
     val appVersion: String = ""
@@ -231,7 +233,9 @@ data class HeartbeatRequest(val appVersion: String = "")
 data class DeviceUpdateRequest(
     val unitName: String = "",
     val contactName: String = "",
-    val phone: String = ""
+    val phone: String = "",
+    val province: String = "",
+    val city: String = ""
 )
 
 /** 客户端版本发布信息（自动更新用）。 */
@@ -266,6 +270,8 @@ data class PublishLatestRequest(val changelog: String = "")
 data class DeviceInfo(
     val id: String = "",
     val unitName: String = "",
+    val province: String = "",
+    val city: String = "",
     val contactName: String = "",
     val phone: String = "",
     val serverAddress: String = "",
@@ -282,6 +288,8 @@ data class DeviceInfo(
 data class DeviceListItem(
     val id: String = "",
     val unitName: String = "",
+    val province: String = "",
+    val city: String = "",
     val contactName: String = "",
     val phone: String = "",
     val serverAddress: String = "",
@@ -290,6 +298,17 @@ data class DeviceListItem(
     val online: Boolean = false,
     val appVersion: String = "",
     val permissions: ClientPermissions = ClientPermissions()
+)
+
+/** 按单位统计的终端数量（后台客户维护用）。 */
+@Serializable
+data class OrgSummaryItem(
+    val orgName: String,
+    val province: String = "",
+    val city: String = "",
+    val deviceCount: Int,
+    val onlineCount: Int,
+    val lastSeen: Long
 )
 
 /** 后台更新设备权限。 */

@@ -78,12 +78,17 @@ object WifiSetup {
     fun isWifiEnabled(context: Context): Boolean =
         wifiManager(context).isWifiEnabled
 
-    /** 是否已通过任意网络（WiFi/移动数据/有线）联网。 */
+    /**
+     * 是否已连接可用网络（WiFi / 移动数据 / 有线）。
+     *
+     * 工业现场通常是无外网的隔离局域网，因此这里**不要求 NET_CAPABILITY_VALIDATED**，
+     * 只要存在具备 INTERNET 能力的活动网络即视为已联网。服务器是否真正可达，
+     * 由后续请求结果判断（激活/心跳失败时会明确提示）。
+     */
     fun isOnline(context: Context): Boolean {
         val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val caps = cm.getNetworkCapabilities(cm.activeNetwork) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
     }
 
     /** 当前网络描述，用于界面展示（如「WiFi：MyHome」「移动数据」「未联网」）。 */

@@ -8,6 +8,7 @@
     config: null,
     tasks: [],
     devices: [],
+    orgSummary: [],
     appVersion: null,
     apkCandidate: null,
     status: null,
@@ -145,6 +146,7 @@
     S.config = await api("/api/v1/config");
     S.tasks = await api("/api/v1/tasks");
     S.devices = await api("/api/v1/devices").catch(() => []);
+    S.orgSummary = await api("/api/v1/devices/org-summary").catch(() => []);
     S.appVersion = await api("/api/v1/app-version-info").catch(() => null);
     S.apkCandidate = await api("/api/v1/app-latest-candidate").catch(() => null);
     $("cfg-version").textContent = S.config.version;
@@ -191,7 +193,7 @@
     { id: "parts", label: "零件与毛坯", sub: "零件、毛坯尺寸与装夹方式", count: (c) => c.parts.length + c.blanks.length },
     { id: "plans", label: "工艺方案", sub: "工序步骤与切削参数", count: (c) => c.plans.length },
     { id: "drawings", label: "图纸任务", sub: "DXF 原文与尺寸校正，客户端据此生成刀路", count: (c) => c.drawings.length },
-    { id: "devices", label: "设备管理", sub: "注册设备、在线状态与功能权限", count: () => S.devices.length },
+    { id: "devices", label: "设备管理", sub: "已激活终端、在线状态与功能权限", count: () => S.devices.length },
     { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length },
     { id: "users", label: "用户管理", sub: "后台账号、角色与模块权限分配", count: () => S.users ? S.users.length : "" }
   ];
@@ -219,15 +221,27 @@
     if (id === "users") loadUsers();
   };
 
-  // ===== 设备页自动刷新：注册/心跳变化 3 秒内可见 =====
+  // ===== 设备页自动刷新：激活/心跳与单位统计变化 3 秒内可见 =====
   function startDevicesPolling() {
     stopDevicesPolling();
     S.devicesTimer = setInterval(async () => {
       if (S.tab !== "devices") { stopDevicesPolling(); return; }
       try {
-        const next = await api("/api/v1/devices");
+        // 只拉设备与单位统计，避免每 3 秒全量拉取配置
+        const [next, org] = await Promise.all([
+          api("/api/v1/devices"),
+          api("/api/v1/devices/org-summary").catch(() => null)
+        ]);
+        let changed = false;
         if (JSON.stringify(next) !== JSON.stringify(S.devices)) {
           S.devices = next;
+          changed = true;
+        }
+        if (Array.isArray(org) && JSON.stringify(org) !== JSON.stringify(S.orgSummary)) {
+          S.orgSummary = org;
+          changed = true;
+        }
+        if (changed) {
           renderNav();
           render();
         }
@@ -775,14 +789,46 @@
     }).join("");
   }
 
+  /** 设备/单位地区展示：省份与城市拼接，缺失时显示灰色「未填写」 */
+  function regionText(province, city) {
+    const p = String(province || "").trim();
+    const c = String(city || "").trim();
+    if (!p && !c) return `<span class="muted">未填写</span>`;
+    return esc([p, c].filter(Boolean).join(" "));
+  }
+
+  /** 单位终端统计卡片：按单位汇总终端总数、在线数与最近活跃 */
+  function orgSummaryHtml() {
+    const list = (S.orgSummary || []).filter((g) => Number(g.deviceCount) >= 1);
+    if (!list.length) {
+      return `<div class="panel"><h3>单位终端统计</h3><div class="empty">暂无单位数据</div></div>`;
+    }
+    const rows = list.map((g) => {
+      const total = Number(g.deviceCount) || 0;
+      const online = Number(g.onlineCount) || 0;
+      const offline = Math.max(0, total - online);
+      return `<tr>
+        <td>${esc(g.orgName)}</td>
+        <td>${regionText(g.province, g.city)}</td>
+        <td>${total}</td>
+        <td><span class="org-badge on">在线 ${online}</span>${offline ? ` <span class="org-badge">离线 ${offline}</span>` : ""}</td>
+        <td class="muted">${fmtTime(g.lastSeen)}</td>
+      </tr>`;
+    }).join("");
+    return `<div class="panel"><h3>单位终端统计</h3>
+      <div class="org-summary${list.length > 8 ? " scroll" : ""}">
+        <table class="grid"><thead><tr><th>单位名称</th><th>地区</th><th>终端总数</th><th>在线</th><th>最近活跃</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div></div>`;
+  }
+
   function viewDevices() {
     const rows = S.devices.map((d) => `
       <tr>
-        <td><code>${esc(d.id)}</code></td>
-        <td>${esc(d.unitName)}</td>
-        <td>${esc(d.contactName)}</td>
-        <td>${esc(d.phone)}</td>
-        <td>${esc(d.serverAddress)}</td>
+        <td><code>${esc(d.id)}</code>${d.serverAddress ? `<div class="muted mono">${esc(d.serverAddress)}</div>` : ""}</td>
+        <td>${d.unitName ? esc(d.unitName) : `<span class="muted">未填写</span>`}</td>
+        <td>${regionText(d.province, d.city)}</td>
+        <td>${d.contactName ? esc(d.contactName) : `<span class="muted">未填写</span>`}${d.phone ? `<div class="muted mono">${esc(d.phone)}</div>` : ""}</td>
         <td>${esc(d.appVersion || "-")}</td>
         <td>${onlineBadge(d)}</td>
         <td>${fmtTime(d.lastSeen)}</td>
@@ -793,8 +839,8 @@
         </td>
       </tr>`).join("");
     const table = rows
-      ? `<table class="grid"><thead><tr><th>设备ID</th><th>单位</th><th>联系人</th><th>电话</th><th>服务器</th><th>版本</th><th>状态</th><th>最近心跳</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
-      : `<div class="desc">暂无注册设备。客户端首次启动完成注册后会出现在这里。同一台设备只能注册一次；如需重新注册，请先「注销」。</div>`;
+      ? `<table class="grid"><thead><tr><th>设备 / 服务器</th><th>单位</th><th>地区</th><th>联系人 / 电话</th><th>版本</th><th>状态</th><th>最近心跳</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="desc">暂无已激活终端。客户端首次启动完成激活后会出现在这里。同一台设备只能激活一次；如需重新激活，请先「注销」。</div>`;
     const ver = S.appVersion;
     const verText = ver && ver.versionCode > 0
       ? `当前已发布：<b>v${esc(ver.versionName)}</b>（versionCode ${ver.versionCode}，${Math.round((ver.sizeBytes || 0) / 1024)} KB，${fmtTime(ver.publishedAt)}）${ver.changelog ? "<br>更新说明：" + esc(ver.changelog) : ""}`
@@ -807,8 +853,9 @@
          </div>`
       : `<div class="desc" style="margin-bottom:10px">未检测到构建产物。请先在电脑上执行 gradlew assembleRelease（或 assembleDebug），服务端会自动识别 app/build/outputs/apk 下的最新 APK。</div>`;
     return `
-      <div class="hint-box">客户端首次打开会先配置网络并注册（单位、姓名、电话、服务器地址）。注册后可在此查看在线状态（25 秒无心跳视为离线），并按设备开关功能权限。本页每 3 秒自动刷新。</div>
-      <div class="panel"><h3>已注册设备</h3>${table}</div>
+      <div class="hint-box">已激活终端列表。设备首次启动需激活并填写单位与地区，便于按单位统计终端数量。</div>
+      ${orgSummaryHtml()}
+      <div class="panel"><h3>已激活终端</h3>${table}</div>
       <div class="panel"><h3>客户端版本发布（自动更新）</h3>
         <div class="desc" style="margin-bottom:10px">${verText}</div>
         ${candHtml}
@@ -835,6 +882,10 @@
     openModal(`修改设备信息（${esc(d.id)}）`, `
       <label class="form-label">单位名称</label>
       <input type="text" id="edit-unit" class="input" value="${esc(d.unitName)}">
+      <div class="grid2" style="margin-top:10px">
+        <div class="field"><label>省份</label><input type="text" class="input" value="${esc(d.province)}" placeholder="未填写" readonly></div>
+        <div class="field"><label>城市</label><input type="text" class="input" value="${esc(d.city)}" placeholder="未填写" readonly></div>
+      </div>
       <label class="form-label" style="margin-top:10px">联系人</label>
       <input type="text" id="edit-contact" class="input" value="${esc(d.contactName)}">
       <label class="form-label" style="margin-top:10px">电话</label>
@@ -851,7 +902,7 @@
   };
 
   window.removeDevice = async function (id, unitName) {
-    if (!confirm(`确认注销设备 ${id}（${unitName}）？\n注销后该设备客户端会提示「设备已注册」无法使用，直到重新注册。`)) return;
+    if (!confirm(`确认注销设备 ${id}（${unitName}）？\n注销后该设备客户端将无法使用，需重新激活。`)) return;
     try {
       await api(`/api/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
       toast("设备已注销");

@@ -230,25 +230,10 @@ fun Application.cncServerModule(adminToken: String) {
             }
             post("/devices/register") {
                 val req = call.receive<RegisterRequest>()
-                // 同一台设备（按硬件标识）只能注册一次；需后台注销后才能重新注册
-                if (req.hardwareId.isNotBlank()) {
-                    val existing = Db.findByHardwareId(req.hardwareId)
-                    if (existing != null) {
-                        call.respond(
-                            HttpStatusCode.Conflict,
-                            SimpleResult(ok = false, message = "设备已注册，如需重新注册请联系管理员")
-                        )
-                        return@post
-                    }
-                }
-                val info = runCatching { Db.registerDevice(req) }.getOrElse {
-                    // 兜底：并发下唯一索引冲突
-                    call.respond(
-                        HttpStatusCode.Conflict,
-                        SimpleResult(ok = false, message = "设备已注册，如需重新注册请联系管理员")
-                    )
-                    return@post
-                }
+                // 设备激活：按 hardwareId 幂等（同一硬件重复激活 = 同一台设备）。
+                // 客户端「清除数据」后本地令牌会丢失，若拒绝激活将永久卡死，
+                // 因此这里不再返回 409，由数据层更新原记录并保留原令牌。
+                val info = Db.registerDevice(req)
                 call.respond(info)
             }
             get("/devices/{id}") {
@@ -650,6 +635,10 @@ fun Application.cncServerModule(adminToken: String) {
                 }
 
                 // ===== 设备管理（后台）=====
+                // 注意：必须注册在 /devices/{id} 之前，避免 org-summary 被当作设备 id
+                get("/devices/org-summary") {
+                    call.respond(Db.orgSummary())
+                }
                 get("/devices") {
                     call.respond(Db.listDevices())
                 }

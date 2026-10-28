@@ -255,6 +255,9 @@ object Db {
                 runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN app_version TEXT NOT NULL DEFAULT ''") }
                 // 设备令牌：客户端凭此访问配置/任务/状态接口（管理口令不下发到平板）
                 runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN device_token TEXT NOT NULL DEFAULT ''") }
+                // 设备激活填写的地区（老记录保持空串，界面显示「未填写」）
+                runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN province TEXT NOT NULL DEFAULT ''") }
+                runCatching { st.executeUpdate("ALTER TABLE devices ADD COLUMN city TEXT NOT NULL DEFAULT ''") }
                 // 老设备回填令牌，客户端下次心跳时自动取回
                 st.executeUpdate("UPDATE devices SET device_token = lower(hex(randomblob(16))) WHERE device_token = ''")
                 // 同一台设备（按硬件标识）只能注册一次（必须在列迁移之后创建）
@@ -832,7 +835,7 @@ object Db {
     private fun decodePermissions(raw: String): ClientPermissions =
         runCatching { json.decodeFromString<ClientPermissions>(raw) }.getOrDefault(ClientPermissions())
 
-    /** 按硬件标识查设备（用于「同一台设备只能注册一次」判定）。 */
+    /** 按硬件标识查设备（用于激活幂等判定）。 */
     fun findByHardwareId(hardwareId: String): DeviceInfo? = withConn { c ->
         if (hardwareId.isBlank()) return@withConn null
         var id: String? = null
@@ -843,52 +846,123 @@ object Db {
         id?.let { getDevice(it) }
     }
 
-    /** 注册一台新设备。调用前需先确认 hardwareId 未被注册（路由层负责 409）。 */
+    /**
+     * 设备注册（激活）：按 hardwareId 幂等。
+     *
+     * - hardwareId 为空：保持旧行为，按 deviceId 新建/替换并签发新令牌；
+     * - hardwareId 已存在：更新该设备的单位/联系人/电话/地区/服务地址/版本，
+     *   保留原 id、注册时间与 device_token，返回更新后的设备信息；
+     * - hardwareId 不存在：新建记录并签发 device_token。
+     *
+     * 不返回 409：客户端「清除数据」后本地令牌丢失，若继续拒绝会导致该设备
+     * 永久无法使用；同一硬件标识重复激活本就属于同一台设备，幂等更新才是
+     * 正确的正式流程。查询与写入在同一连接内完成，避免与唯一索引冲突。
+     */
     fun registerDevice(req: RegisterRequest): DeviceInfo = withConn { c ->
-        val id = req.deviceId.ifBlank { "dev-${UUID.randomUUID().toString().take(8)}" }
         val now = System.currentTimeMillis()
+        if (req.hardwareId.isNotBlank()) {
+            var existingId: String? = null
+            var existingToken = ""
+            var existingRegisteredAt = 0L
+            var existingPerms = ClientPermissions()
+            c.prepareStatement(
+                "SELECT id, registered_at, permissions, device_token FROM devices WHERE hardware_id = ?"
+            ).use { ps ->
+                ps.setString(1, req.hardwareId)
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) {
+                        existingId = rs.getString("id")
+                        existingRegisteredAt = rs.getLong("registered_at")
+                        existingPerms = decodePermissions(rs.getString("permissions"))
+                        existingToken = rs.getString("device_token").orEmpty()
+                    }
+                }
+            }
+            val id = existingId
+            if (id != null) {
+                c.prepareStatement(
+                    """
+                    UPDATE devices SET unit_name = ?, contact_name = ?, phone = ?,
+                        province = ?, city = ?, server_address = ?, app_version = ?,
+                        last_seen = ?, online = 1
+                    WHERE id = ?
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, req.unitName)
+                    ps.setString(2, req.contactName)
+                    ps.setString(3, req.phone)
+                    ps.setString(4, req.province)
+                    ps.setString(5, req.city)
+                    ps.setString(6, req.serverAddress)
+                    ps.setString(7, req.appVersion)
+                    ps.setLong(8, now)
+                    ps.setString(9, id)
+                    ps.executeUpdate()
+                }
+                return@withConn DeviceInfo(
+                    id = id,
+                    unitName = req.unitName,
+                    contactName = req.contactName,
+                    phone = req.phone,
+                    province = req.province,
+                    city = req.city,
+                    serverAddress = req.serverAddress,
+                    registeredAt = existingRegisteredAt,
+                    lastSeen = now,
+                    online = true,
+                    permissions = existingPerms,
+                    token = existingToken
+                )
+            }
+        }
+        val id = req.deviceId.ifBlank { "dev-${UUID.randomUUID().toString().take(8)}" }
         val existingPerms = c.getDeviceRaw(id)?.let { decodePermissions(it) } ?: ClientPermissions()
         // 签发设备令牌：客户端后续用它访问配置/任务/状态接口
         val token = UUID.randomUUID().toString().replace("-", "")
         c.prepareStatement(
             """
             INSERT OR REPLACE INTO devices(
-                id, unit_name, contact_name, phone, server_address,
+                id, unit_name, contact_name, phone, province, city, server_address,
                 registered_at, last_seen, online, permissions, hardware_id, app_version, device_token
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """.trimIndent()
         ).use { ps ->
             ps.setString(1, id)
             ps.setString(2, req.unitName)
             ps.setString(3, req.contactName)
             ps.setString(4, req.phone)
-            ps.setString(5, req.serverAddress)
-            ps.setLong(6, now)
-            ps.setLong(7, now)
-            ps.setInt(8, 1)
-            ps.setString(9, json.encodeToString(ClientPermissions.serializer(), existingPerms))
-            ps.setString(10, req.hardwareId)
-            ps.setString(11, req.appVersion)
-            ps.setString(12, token)
+            ps.setString(5, req.province)
+            ps.setString(6, req.city)
+            ps.setString(7, req.serverAddress)
+            ps.setLong(8, now)
+            ps.setLong(9, now)
+            ps.setInt(10, 1)
+            ps.setString(11, json.encodeToString(ClientPermissions.serializer(), existingPerms))
+            ps.setString(12, req.hardwareId)
+            ps.setString(13, req.appVersion)
+            ps.setString(14, token)
             ps.executeUpdate()
         }
         DeviceInfo(
             id = id, unitName = req.unitName, contactName = req.contactName,
-            phone = req.phone, serverAddress = req.serverAddress,
+            phone = req.phone, province = req.province, city = req.city,
+            serverAddress = req.serverAddress,
             registeredAt = now, lastSeen = now, online = true,
             permissions = existingPerms, token = token
         )
     }
 
-    /** 后台修改设备信息（单位/联系人/电话）。 */
+    /** 后台修改设备信息（单位/联系人/电话/地区）。 */
     fun updateDeviceInfo(id: String, req: DeviceUpdateRequest): Boolean = withConn { c ->
         c.prepareStatement(
-            "UPDATE devices SET unit_name = ?, contact_name = ?, phone = ? WHERE id = ?"
+            "UPDATE devices SET unit_name = ?, contact_name = ?, phone = ?, province = ?, city = ? WHERE id = ?"
         ).use { ps ->
             ps.setString(1, req.unitName)
             ps.setString(2, req.contactName)
             ps.setString(3, req.phone)
-            ps.setString(4, id)
+            ps.setString(4, req.province)
+            ps.setString(5, req.city)
+            ps.setString(6, id)
             ps.executeUpdate() > 0
         }
     }
@@ -905,7 +979,7 @@ object Db {
         val permsRaw = c.getDeviceRaw(id) ?: return@withConn null
         var info: DeviceInfo? = null
         c.prepareStatement(
-            "SELECT unit_name, contact_name, phone, server_address, registered_at, last_seen, online, device_token FROM devices WHERE id = ?"
+            "SELECT unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, device_token FROM devices WHERE id = ?"
         ).use { ps ->
             ps.setString(1, id)
             ps.executeQuery().use { rs ->
@@ -915,6 +989,8 @@ object Db {
                         unitName = rs.getString("unit_name"),
                         contactName = rs.getString("contact_name"),
                         phone = rs.getString("phone"),
+                        province = rs.getString("province").orEmpty(),
+                        city = rs.getString("city").orEmpty(),
                         serverAddress = rs.getString("server_address"),
                         registeredAt = rs.getLong("registered_at"),
                         lastSeen = rs.getLong("last_seen"),
@@ -930,7 +1006,7 @@ object Db {
 
     fun listDevices(): List<DeviceListItem> = withConn { c ->
         c.prepareStatement(
-            "SELECT id, unit_name, contact_name, phone, server_address, registered_at, last_seen, online, app_version, permissions FROM devices ORDER BY registered_at DESC"
+            "SELECT id, unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, app_version, permissions FROM devices ORDER BY registered_at DESC"
         ).use { ps ->
             ps.executeQuery().use { rs ->
                 buildList {
@@ -940,6 +1016,8 @@ object Db {
                             unitName = rs.getString("unit_name"),
                             contactName = rs.getString("contact_name"),
                             phone = rs.getString("phone"),
+                            province = rs.getString("province").orEmpty(),
+                            city = rs.getString("city").orEmpty(),
                             serverAddress = rs.getString("server_address"),
                             registeredAt = rs.getLong("registered_at"),
                             lastSeen = rs.getLong("last_seen"),
@@ -949,6 +1027,35 @@ object Db {
                         )
                     )
                 }
+            }
+        }
+    }
+
+    /** 按「单位 + 省份 + 城市」统计终端数量（后台客户维护用）。 */
+    fun orgSummary(): List<OrgSummaryItem> = withConn { c ->
+        c.prepareStatement(
+            "SELECT unit_name, province, city, last_seen FROM devices"
+        ).use { ps ->
+            ps.executeQuery().use { rs ->
+                val groups = LinkedHashMap<Triple<String, String, String>, MutableList<Long>>()
+                while (rs.next()) {
+                    val key = Triple(
+                        rs.getString("unit_name").orEmpty(),
+                        rs.getString("province").orEmpty(),
+                        rs.getString("city").orEmpty()
+                    )
+                    groups.getOrPut(key) { mutableListOf() }.add(rs.getLong("last_seen"))
+                }
+                groups.map { (key, lastSeenList) ->
+                    OrgSummaryItem(
+                        orgName = key.first,
+                        province = key.second,
+                        city = key.third,
+                        deviceCount = lastSeenList.size,
+                        onlineCount = lastSeenList.count { isOnline(it) },
+                        lastSeen = lastSeenList.maxOrNull() ?: 0L
+                    )
+                }.sortedByDescending { it.deviceCount }
             }
         }
     }

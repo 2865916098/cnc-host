@@ -106,16 +106,16 @@ class KioskSettingsViewModel(application: Application) : AndroidViewModel(applic
     }
 
     /**
-     * 清除数据重新注册：清掉本机注册信息与设备令牌后，直接前台重启主界面，
-     * 回到「配网 → 权限 → 注册」流程。
+     * 清除数据重新激活：清掉本机激活信息与设备令牌后，直接前台重启主界面，
+     * 回到「配网 → 权限 → 激活」流程。
      *
      * 注意：不能用 AlarmManager+杀进程重启——Android 12+/MIUI 会拦截后台
      * 启动 Activity 导致重启丢失。当前应用在前台，直接 startActivity 可靠。
-     * 服务端仍保留该设备记录，重新注册会被拒绝，需管理员先在后台「注销」。
+     * 服务端仍保留该设备记录，重新激活会沿用原有登记信息。
      */
     fun resetRegistration() {
         val app = getApplication<Application>()
-        LogRecorder.info(app, "SYSTEM", "用户触发清除数据，准备重新注册")
+        LogRecorder.info(app, "SYSTEM", "用户触发清除数据，准备重新激活")
         SetupPrefs.clearRegistration(app)
         ServerPrefs.clearAuth(app)
         SetupPrefs.setExited(app, false)

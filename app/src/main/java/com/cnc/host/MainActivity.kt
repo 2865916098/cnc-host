@@ -71,7 +71,7 @@ import com.cnc.host.ui.settings.SettingsScreen
 import com.cnc.host.ui.setup.KioskSettingsOverlay
 import com.cnc.host.ui.setup.NetworkSetupScreen
 import com.cnc.host.ui.setup.PermissionsSetupScreen
-import com.cnc.host.ui.setup.RegisterScreen
+import com.cnc.host.ui.setup.ActivationScreen
 import com.cnc.host.ui.simple.SimpleAlarmsScreen
 import com.cnc.host.ui.simple.SimpleMonitorScreen
 import com.cnc.host.ui.simple.SimplePreviewScreen
@@ -167,8 +167,8 @@ class MainActivity : ComponentActivity() {
 /**
  * 主界面。
  *
- * 首次启动（未注册）时先引导「网络配置 → 设备注册」；
- * 注册完成后进入主界面。主界面默认是傻瓜式简易模式：底部 4 个页签
+ * 首次启动（未激活）时先引导「网络配置 → 权限引导 → 设备激活」；
+ * 激活完成后进入主界面。主界面默认是傻瓜式简易模式：底部 4 个页签
  * （任务 / 预览下发 / 运行监控 / 报警状态）。高级配置通过顶部「高级模式」+ PIN 进入，
  * 使用左侧导航栏。顶部右侧「设置」按钮需管理员密码，可修改服务器地址或临时退出到安卓桌面。
  *
@@ -183,17 +183,21 @@ fun CncHostApp() {
         mutableStateOf(SetupPrefs.load(context).setupCompleted)
     }
 
-    // 首次启动引导流程：0=网络配置，1=权限与自启，2=设备注册
+    // 首次启动引导流程：0=网络配置，1=权限与自启，2=设备激活
     var setupStep by rememberSaveable { mutableIntStateOf(0) }
 
     if (!setupCompleted) {
         when (setupStep) {
             0 -> NetworkSetupScreen(onNext = { setupStep = 1 })
             1 -> PermissionsSetupScreen(onNext = { setupStep = 2 })
-            else -> RegisterScreen(onRegistered = {
-                setupCompleted = true
-                PermissionsHolder.load(context)
-            })
+            else -> ActivationScreen(
+                onActivated = {
+                    setupCompleted = true
+                    PermissionsHolder.load(context)
+                },
+                // 激活时检测到未联网：回到第 0 步重新配置网络
+                onGoToNetwork = { setupStep = 0 }
+            )
         }
         return
     }

@@ -5,13 +5,13 @@ import com.cnc.host.sync.ClientPermissionsDto
 import com.google.gson.Gson
 
 /**
- * 设备注册与首次启动配置。
+ * 设备激活与首次启动配置。
  *
  * 与 ServerPrefs 分工：
  * - ServerPrefs：服务端配置同步的连接参数（管理口令、设备编号等）
- * - SetupPrefs：设备注册信息、首次启动是否完成、缓存的管理员密码与权限
+ * - SetupPrefs：设备激活信息、首次启动是否完成、缓存的管理员密码与权限
  *
- * 注册成功后 setupCompleted = true，MainActivity 才进入主界面。
+ * 激活成功后 setupCompleted = true，MainActivity 才进入主界面。
  */
 data class DeviceIdentity(
     val setupCompleted: Boolean = false,
@@ -82,10 +82,9 @@ object SetupPrefs {
     }
 
     /**
-     * 清除注册信息（设置里的「清除数据重新注册」）。
+     * 清除激活信息（设置里的「清除数据重新激活」）。
      *
-     * 只清本机注册状态，服务端仍保留该设备记录——因此重新注册时会被拒绝，
-     * 需管理员在后台「注销」后才能重新注册。
+     * 只清本机激活状态，服务端仍保留该设备记录；重新激活会沿用原有登记信息。
      */
     fun clearRegistration(context: Context) {
         prefs(context).edit()

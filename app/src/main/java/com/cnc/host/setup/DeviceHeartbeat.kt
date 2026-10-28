@@ -92,7 +92,7 @@ object DeviceHeartbeat {
                         val msg = e.message ?: "心跳失败"
                         // 404：服务端找不到该设备（可能已被后台注销）
                         if (msg.contains("404") || msg.contains("不存在") || msg.contains("已注销")) {
-                            LogRecorder.warn(context, "COMMUNICATION", "心跳 404，设备可能已被注销，需重新注册：$msg")
+                            LogRecorder.warn(context, "COMMUNICATION", "心跳 404，设备可能已被注销，需重新激活：$msg")
                         } else {
                             LogRecorder.debug(context, "COMMUNICATION", "心跳异常：$msg")
                         }

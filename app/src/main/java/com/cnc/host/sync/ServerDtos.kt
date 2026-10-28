@@ -182,9 +182,13 @@ data class RegisterRequestDto(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    /** 设备归属省份（如「广东省」），后台按地区统计终端数量。 */
+    val province: String = "",
+    /** 设备归属城市（如「深圳市」）。 */
+    val city: String = "",
     val serverAddress: String = "",
     val deviceId: String = "",
-    /** 硬件唯一标识（Android ID）：同一台设备只允许注册一次。 */
+    /** 硬件唯一标识（Android ID）：同一台设备只做一次激活登记，重复激活沿用原记录。 */
     val hardwareId: String = "",
     /** 当前客户端版本号，后台可见。 */
     val appVersion: String = ""
@@ -208,6 +212,10 @@ data class DeviceInfoDto(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    /** 设备归属省份（旧服务端未返回时为空白，保持向后兼容）。 */
+    val province: String = "",
+    /** 设备归属城市（旧服务端未返回时为空白，保持向后兼容）。 */
+    val city: String = "",
     val serverAddress: String = "",
     val registeredAt: Long = 0L,
     val lastSeen: Long = 0L,

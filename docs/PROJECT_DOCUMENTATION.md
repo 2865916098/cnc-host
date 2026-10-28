@@ -23,7 +23,7 @@ CNC Host 面向 **X/Z 两轴数控车床** 的加工现场，提供一套「平�
 | 组成 | 形态 | 运行位置 | 主要职责 |
 |---|---|---|---|
 | Android 客户端 | 横屏工业平板 App（Kotlin + Compose） | 机床旁平板 | Kiosk 常驻、选任务、预览下发、运行监控、报警查看；缓存服务端配置，断网可继续使用缓存 |
-| 局域网服务端 | Kotlin JVM + Ktor 独立进程 | 车间服务器 / 工控机 | 配置与任务 REST API、设备注册/心跳、状态 WebSocket、SQLite 持久化、APK 发布 |
+| 局域网服务端 | Kotlin JVM + Ktor 独立进程 | 车间服务器 / 工控机 | 配置与任务 REST API、设备激活/心跳、状态 WebSocket、SQLite 持久化、APK 发布 |
 | Web 管理后台 | 服务端内置静态页面（`/admin/`） | 浏览器 | 维护刀具/材料/零件/毛坯/工艺/图纸，管理设备与功能权限、用户与角色、任务记录、客户端版本发布 |
 | 控制卡 | 硬件（尚未接入） | 机床电柜 | 运动、主轴、IO、报警的真实执行机构；当前由模拟器代替 |
 
@@ -153,7 +153,7 @@ cnc-host-git-baseline/
 
 | 模块 | 类型 | 依赖 | 职责 |
 |---|---|---|---|
-| `app` | Android Application | 以下全部核心模块 | 客户端全部界面、Kiosk、注册、同步、日志、更新、Room |
+| `app` | Android Application | 以下全部核心模块 | 客户端全部界面、Kiosk、激活、同步、日志、更新、Room |
 | `core-model` | Kotlin JVM | 无 | 零件、刀具、材料、图纸、刀路、设备快照、报警、任务、自动化配方等统一模型 |
 | `core-ui` | Android Library | Compose | 工业 HMI 配色、字体、面板与状态指示灯 |
 | `device-api` | Kotlin JVM | core-model + coroutines | `DeviceController` 接口、命令定义、命令队列终态语义 |
@@ -196,7 +196,7 @@ cnc-host-git-baseline/
 |---|---|---|---|
 | 第 1 步：网络 | `NetworkSetupScreen` + `WifiSetup` | 显示联网状态；扫描附近 WiFi；在 App 内通过 `WifiNetworkSpecifier` 输入密码连接；WiFi 关闭时调起系统 WiFi 面板（浮层，不离开应用）；也可使用移动数据/有线网络 | 是（已联网直接下一步） |
 | 第 2 步：权限与自启 | `PermissionsSetupScreen` + `KioskPermissions` | 三项系统授权：悬浮窗/后台弹出界面、忽略电池优化、厂商「开机自启」设置页（小米/OPPO/vivo/华为/荣耀分别跳转，底部兜底应用详情页）；从系统页返回时自动刷新状态 | 是（不授权只降低保活强度） |
-| 第 3 步：注册 | `RegisterScreen` + `RegisterViewModel` | 单位名称、联系人、电话、服务器地址；提交后调用 `POST /api/v1/devices/register` | 否（必填单位/联系人/电话） |
+| 第 3 步：激活 | `RegisterScreen` + `RegisterViewModel` | 省份、城市（地区）、单位名称、联系人、电话、服务器地址；提交后调用 `POST /api/v1/devices/register` | 否（必填省份/城市/单位/联系人/电话） |
 
 **服务器地址规则**
 
@@ -204,25 +204,33 @@ cnc-host-git-baseline/
 - 未填地址时自动局域网搜索：对本机 WiFi `/24` 网段 1–254 并发探测 8080，请求 `/api/v1/health` 并校验响应含 `cnc-server`，连接超时 400 ms。
 - 地址默认沿用上次保存值；首次安装且为空时自动触发搜索。
 
-**注册成功后写入**
+**激活表单与地区选择**
+
+- 字段顺序：省份 → 城市（地区） → 单位名称 → 联系人 → 电话；服务器地址沿用上方「服务器地址规则」。
+- 地区数据：客户端内置 **34 个省级行政区、361 个城市项**（`ProvinceCityData.kt`），离线可选，无需联网拉取行政区划；切换省份会清空不属于该省的城市。
+- 联网前置校验：点击「激活」时先调用 `WifiSetup.isOnline()`，未联网直接拦截、不发起请求；页面提示「网络尚未连接，网络不可用，请先连接 WiFi 或移动数据」，并提供「去配置网络」入口。
+- 表单校验：省份/城市必选；单位名称非空且不超过 100 字；联系人非空；电话为 10–13 位数字。
+
+**激活成功后写入**
 
 - `SetupPrefs`：`setupCompleted=true`、`deviceId`、单位/联系人/电话/服务器地址、权限 JSON。
 - `ServerPrefs`：`baseUrl`、服务端签发的 `token`、`deviceId`、`enabled=true`。此后配置同步、任务/状态/日志上报均使用设备令牌，不再需要管理口令。
 
-### 5.3 设备注册与心跳
+### 5.3 设备激活与心跳
 
 | 项目 | 实现 |
 |---|---|
 | 硬件唯一标识 | `Settings.Secure.ANDROID_ID`（`hardwareId()`），重装/清数据后保持不变 |
-| 唯一约束 | `devices.hardware_id` 上的**部分唯一索引** `WHERE hardware_id != ''`；重复注册返回 HTTP 409「设备已注册，如需重新注册请联系管理员」 |
-| 设备 ID | 注册请求未带 `deviceId` 时生成 `dev-<UUID 前 8 位>` |
-| 设备令牌 | 注册时服务端生成 32 位随机十六进制串写入 `devices.device_token`，随注册响应返回；心跳响应也携带 |
+| 幂等激活 | 同一 `hardwareId` 重复激活时，服务端更新单位/联系人/电话/`province`/`city`/服务端地址/版本，**保留原 `id` 与 `device_token`** 并返回 200，不再返回 409；`hardwareId` 为空时按新建处理 |
+| 唯一约束 | `devices.hardware_id` 上的**部分唯一索引** `WHERE hardware_id != ''`，作为幂等激活的查询依据 |
+| 设备 ID | 激活请求未带 `deviceId` 时生成 `dev-<UUID 前 8 位>`；幂等激活沿用原设备 ID |
+| 设备令牌 | 激活时服务端生成 32 位随机十六进制串写入 `devices.device_token`，随激活响应返回；重复激活返回原令牌，心跳响应也携带 |
 | 心跳周期 | 客户端每 **10 秒** `POST /api/v1/devices/{id}/heartbeat`，附加 `appVersion` |
 | 离线判定 | 服务端 `isOnline(lastSeen)`：`now - last_seen < 25 秒`；后台设备页每 3 秒轮询 |
 | 权限下发 | 心跳响应带 `ClientPermissions`，客户端写入 `SetupPrefs` 并更新 `PermissionsHolder` StateFlow |
 | 令牌自愈 | 仅当本地 `ServerPrefs.token` 为空且心跳响应带 `token` 时补齐（老版本客户端升级场景） |
 | 心跳副作用 | `SyncManager.refresh()`、`markOnline(true)`、探测 `config/version`、补传日志、顺带 `AppUpdate.check()`（最多 60 秒一次） |
-| 设备被注销 | 心跳返回 404 时客户端**仅记录 WARN 日志**，不会自动清除注册信息；需管理员在平板设置中「清除数据重新注册」 |
+| 设备被注销 | 心跳返回 404 时客户端**仅记录 WARN 日志**，不会自动清除激活信息；需管理员在平板设置中「清除数据重新激活」 |
 
 **权限项与实际显隐**
 
@@ -259,7 +267,7 @@ cnc-host-git-baseline/
 - `ui/components/KioskKeyboard.kt` 提供 `KioskTextField`：渲染为只读输入框，点击后弹出应用内 `KioskKeyboardDialog`。
 - 键盘含数字页（1–9、0、`.`、`-`、`:`、`_`、`@`、退格、清空、完成）与 QWERTY 字母页（大小写切换、空格、123 切换）。
 - `keyboardType` 为 `Number/NumberPassword/Decimal/Phone` 时默认数字页；密码框回显与面板均以 `•` 掩码。
-- 当前客户端共 20 处 `KioskTextField` 调用（另有 1 处为其函数声明），覆盖注册、登录密码、IP、参数等输入。
+- 当前客户端共 20 处 `KioskTextField` 调用（另有 1 处为其函数声明），覆盖激活、登录密码、IP、参数等输入。
 
 **用法（关键签名）**
 
@@ -324,7 +332,7 @@ KioskTextField(
 | 登录 | `POST /api/v1/admin/login` | 无 | 账号密码登录，返回 7 天会话 token、角色、权限 |
 | 登录 | `POST /api/v1/admin/logout` | 是 | 使当前会话失效 |
 | 登录 | `GET /api/v1/auth/check` | 是 | 校验 token |
-| 设备 | `POST /api/v1/devices/register` | 无 | 注册设备，返回设备令牌与默认权限 |
+| 设备 | `POST /api/v1/devices/register` | 无 | 激活设备（按 hardwareId 幂等），返回设备令牌与默认权限 |
 | 设备 | `GET /api/v1/devices/{id}` | 无 | 查询设备信息与权限 |
 | 设备 | `POST /api/v1/devices/{id}/heartbeat` | 无 | 心跳，更新在线状态并下发权限与令牌 |
 | 设备 | `POST /api/v1/devices/{id}/verify-admin` | 无 | 校验管理员密码（客户端设置入口） |
@@ -340,7 +348,8 @@ KioskTextField(
 | 日志 | `GET /api/v1/logs?deviceId=&limit=` | 是 | 管理端查询（默认 500 条） |
 | 日志 | `DELETE /api/v1/logs?deviceId=&olderThanMs=` | 是 | 清理（默认清理 7 天前） |
 | 设备管理 | `GET /api/v1/devices` | 是 | 设备列表 |
-| 设备管理 | `PUT/DELETE /api/v1/devices/{id}` | 是 | 修改信息 / 注销 |
+| 设备管理 | `GET /api/v1/devices/org-summary` | 是 | 单位终端统计（按单位+省份+城市分组，含设备数/在线数） |
+| 设备管理 | `PUT/DELETE /api/v1/devices/{id}` | 是 | 修改信息（含地区）/ 注销 |
 | 设备管理 | `PUT /api/v1/devices/{id}/permissions` | 是 | 更新功能权限 |
 | 用户 | `GET/POST /api/v1/users`、`PUT/DELETE /api/v1/users/{id}`、`POST /api/v1/users/{id}/reset-password` | 是（users 权限） | 用户管理 |
 | 用户 | `GET /api/v1/users/me`、`PUT /api/v1/users/me/password` | 登录即可 | 当前账号信息/改密 |
@@ -367,7 +376,7 @@ KioskTextField(
 | `drawing_corrections` | `drawingId TEXT PK`, `scale REAL`, `offsetX REAL`, `offsetY REAL`, `rotationDeg REAL`, `mirrorX INTEGER`, `mirrorY INTEGER`, `unit TEXT` | 图纸尺寸校正 |
 | `task_history` | `id TEXT PK`, `partName TEXT`, `planId TEXT`, `status TEXT`, `durationSec REAL`, `operator TEXT`, `startedAt INTEGER`, `finishedAt INTEGER` | 平板回传的加工任务记录 |
 | `operation_logs` | `id INTEGER PK AUTOINCREMENT`, `device_id TEXT`, `timestamp INTEGER`, `level TEXT`, `category TEXT`, `message TEXT`, `task_id TEXT`, `details TEXT` | 设备操作日志 |
-| `devices` | `id TEXT PK`, `unit_name TEXT`, `contact_name TEXT`, `phone TEXT`, `server_address TEXT`, `registered_at INTEGER`, `last_seen INTEGER`, `online INTEGER`, `permissions TEXT`, `hardware_id TEXT`（迁移列）, `app_version TEXT`（迁移列）, `device_token TEXT`（迁移列） | 注册设备、在线状态、功能权限、设备令牌 |
+| `devices` | `id TEXT PK`, `unit_name TEXT`, `contact_name TEXT`, `phone TEXT`, `province TEXT`（迁移列）, `city TEXT`（迁移列）, `server_address TEXT`, `registered_at INTEGER`, `last_seen INTEGER`, `online INTEGER`, `permissions TEXT`, `hardware_id TEXT`（迁移列）, `app_version TEXT`（迁移列）, `device_token TEXT`（迁移列） | 激活设备、地区、在线状态、功能权限、设备令牌 |
 | `admin_sessions` | `token TEXT PK`, `username TEXT`, `created_at INTEGER`, `expires_at INTEGER`, `user_id TEXT`（迁移列） | 管理后台登录会话 |
 | `users` | `id TEXT PK`, `username TEXT UNIQUE`, `password_hash TEXT`, `display_name TEXT`, `role TEXT`, `permissions TEXT`, `enabled INTEGER`, `created_at INTEGER`, `last_login_at INTEGER DEFAULT 0` | 后台用户、角色、模块权限 |
 
@@ -376,7 +385,7 @@ KioskTextField(
 | 索引 | 定义 | 用途 |
 |---|---|---|
 | `idx_op_logs_device` | `operation_logs(device_id, timestamp DESC)` | 按设备查询日志 |
-| `idx_devices_hardware_id` | `devices(hardware_id) WHERE hardware_id != ''` | 一机一注册 |
+| `idx_devices_hardware_id` | `devices(hardware_id) WHERE hardware_id != ''` | 硬件标识唯一，幂等激活依据 |
 
 #### 6.2.2 关键表字段明细
 
@@ -384,11 +393,12 @@ KioskTextField(
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| id | TEXT PK | 设备 ID（`dev-xxxxxxxx` 或注册时指定） |
+| id | TEXT PK | 设备 ID（`dev-xxxxxxxx` 或激活时指定） |
 | unit_name / contact_name / phone | TEXT | 单位、联系人、电话 |
-| server_address | TEXT | 注册时填写的服务端地址 |
-| registered_at / last_seen | INTEGER | 注册时间、最近心跳时间（毫秒） |
-| online | INTEGER | 注册/心跳时写 1；列表读取时按 `last_seen` 重新计算 |
+| province / city | TEXT | 省份、城市（激活时选择，后台按此做单位终端统计） |
+| server_address | TEXT | 激活时填写的服务端地址 |
+| registered_at / last_seen | INTEGER | 激活时间、最近心跳时间（毫秒） |
+| online | INTEGER | 激活/心跳时写 1；列表读取时按 `last_seen` 重新计算 |
 | permissions | TEXT | `ClientPermissions` 的 JSON |
 | hardware_id | TEXT | Android ID；部分唯一索引 |
 | app_version | TEXT | 客户端上报的 versionName |
@@ -442,7 +452,7 @@ KioskTextField(
 |---|---|---|---|
 | 环境变量管理口令 `CNC_ADMIN_TOKEN` | 服务端启动配置 | 超管虚拟账号，可调用全部管理接口 | 长期（改环境变量并重启才变化） |
 | 后台会话 token | `POST /api/v1/admin/login` | 按用户角色与模块权限 | 7 天 |
-| 设备令牌 `device_token` | 设备注册时签发，心跳响应携带 | 最小权限：GET 读配置/状态（用户管理除外）；POST `/tasks`、`/status`、`/logs`；禁止写配置与账号管理 | 与设备同生命周期 |
+| 设备令牌 `device_token` | 设备激活时签发，心跳响应携带 | 最小权限：GET 读配置/状态（用户管理除外）；POST `/tasks`、`/status`、`/logs`；禁止写配置与账号管理 | 与设备同生命周期 |
 
 **角色**
 
@@ -477,7 +487,20 @@ KioskTextField(
 4. 其他用户：只读 GET（不含用户管理）仅要求权限列表非空；写操作要求包含对应模块 key。
 5. `users/me` 与 `users/me/password` 不受模块权限限制。
 
-### 6.4 配置版本机制
+### 6.4 单位终端统计
+
+后台「设备管理」通过 `GET /api/v1/devices/org-summary` 按客户维护终端，需 `devices` 模块权限（设备令牌 GET 放行）。统计规则：
+
+| 项目 | 实现 |
+|---|---|
+| 分组键 | `devices` 表的 `unit_name + province + city`，三者完全相同归为一组 |
+| 设备数 | 组内设备记录数 `deviceCount` |
+| 在线数 | 组内 `last_seen` 距当前时间小于 25 秒（`isOnline()`）的记录数 `onlineCount` |
+| 最近心跳 | 组内 `last_seen` 的最大值 `lastSeen`（毫秒） |
+| 排序 | 按 `deviceCount` 降序 |
+| 空值 | 单位/省份/城市为空串时仍参与分组，会形成「未填写地区」的组 |
+
+### 6.5 配置版本机制
 
 - `meta.config_version` 是唯一版本号，初始值 1。
 - 所有配置写操作（设备、刀具、材料、零件、毛坯、工艺、图纸、校正等）在事务中调用 `Connection.bumpVersion()`，版本号 +1。
@@ -489,7 +512,7 @@ KioskTextField(
   4. 覆盖成功后写入新版本号；失败保留旧缓存并提示。
 - 版本号没有重置接口；如需重置只能直接改库（不推荐）。
 
-### 6.5 APK 发布
+### 6.6 APK 发布
 
 | 能力 | 实现 |
 |---|---|
@@ -517,7 +540,7 @@ KioskTextField(
 | 零件与毛坯 | 零件与材料关联、毛坯直径/长度/装夹方式 |
 | 工艺方案 | 方案头 + 工序步骤（粗车/精车等类型、刀具、转速、进给、切深、余量、安全距离） |
 | 图纸任务 | 粘贴 DXF 文本或上传 `.dxf`，维护尺寸校正（缩放/偏移/旋转/镜像/单位） |
-| 设备管理 | 注册设备列表（ID、单位、联系人、电话、服务器、版本、在线、最近心跳）；修改信息；逐项开关功能权限；注销；**客户端版本发布**（一键发布最新构建/手动上传）；修改管理员账号密码 |
+| 设备管理 | 激活设备列表（ID、单位、省份、城市、联系人、电话、服务器、版本、在线、最近心跳）；「单位终端统计」面板（按单位+省份+城市汇总设备数/在线数/最近心跳）；修改信息（含地区）；逐项开关功能权限；注销；**客户端版本发布**（一键发布最新构建/手动上传）；修改管理员账号密码 |
 | 任务记录 | 平板回传的任务列表（零件、方案、状态、时长、操作员、起止时间） |
 | 用户管理 | 后台用户列表、新建、编辑角色/权限、重置密码、禁用/启用、删除 |
 
@@ -639,7 +662,7 @@ server\build\install\cnc-server\bin\cnc-server.bat
 |---|---|
 | 安装 APK | 允许「安装未知来源应用」，安装 `app-debug.apk` |
 | 屏幕 | 固定横屏；建议关闭自动旋转 |
-| 首次启动 | 按引导完成网络 → 权限 → 注册 |
+| 首次启动 | 按引导完成网络 → 权限 → 激活 |
 | 悬浮窗/后台弹出 | 在系统设置中允许本应用（小米等 ROM 必须） |
 | 忽略电池优化 | 在系统设置中允许 |
 | 厂商开机自启 | 在厂商安全中心手动打开（**无法由 App 静默完成**） |
@@ -651,8 +674,8 @@ server\build\install\cnc-server\bin\cnc-server.bat
 
 | 现象 | 可能原因 | 处理 |
 |---|---|---|
-| 注册时搜不到服务器 | 平板与服务端不在同一网段；服务端未启动；防火墙拦截 8080 | 用平板浏览器访问 `http://<IP>:8080/api/v1/health`；检查防火墙与网段 |
-| 注册提示「设备已注册」 | 该 Android ID 已注册过 | 后台「设备管理」注销该设备，再在平板设置中「清除数据重新注册」 |
+| 激活时搜不到服务器 | 平板与服务端不在同一网段；服务端未启动；防火墙拦截 8080 | 用平板浏览器访问 `http://<IP>:8080/api/v1/health`；检查防火墙与网段 |
+| 重复激活 | 同一 Android ID 已登记 | 无需先注销：重新激活按 hardwareId 幂等更新单位/联系人/电话/地区，保留原设备 ID 与令牌 |
 | 设备显示离线 | 25 秒内无心跳；WiFi 断开；服务器地址/token 错误 | 检查平板网络、设置中的服务器地址；查看服务端日志 |
 | 任务/配置不更新 | `config_version` 未变化；设备令牌缺失；同步失败 | 高级模式「服务端同步」→ 测试连接/立即同步；后台确认配置已保存 |
 | 自动更新不弹窗 | `versionCode` 未递增；未发布；检查节流 60 秒 | 修改 `versionCode` 重新构建并一键发布 |
@@ -675,17 +698,18 @@ server\build\install\cnc-server\bin\cnc-server.bat
 | Kiosk | 开机自启、前台看门狗 700 ms、闪退 1.5 s 重启、返回键拦截、Home 键拉回、沉浸式、屏幕常亮 | ✅ | `BootReceiver`、`KioskService`、`CncApplication`、`MainActivity` |
 | Kiosk | 悬浮窗/电池白名单/厂商自启引导 | ✅ | `PermissionsSetupScreen`、`KioskPermissions` |
 | 首启 | App 内 WiFi 扫描与连接、联网检测 | ✅ | `NetworkSetupScreen`、`WifiSetup` |
-| 注册 | 单位/联系人/电话/服务器地址注册；IP 自动补全；局域网自动发现 | ✅ | `RegisterViewModel`、`ServerAddress` |
-| 注册 | 一机一注册（hardwareId 唯一）、重复注册 409 | ✅ | `devices` 部分唯一索引、`Routes` |
-| 注册 | 设备令牌签发与心跳自愈 | ✅ | `Db.registerDevice`、`DeviceHeartbeat` |
+| 设备激活 | 省份/城市/单位/联系人/电话/服务器地址；内置 34 个省级行政区、361 个城市项；IP 自动补全；局域网自动发现 | ✅ | `RegisterViewModel`、`RegisterScreen`、`ProvinceCityData`、`ServerAddress` |
+| 设备激活 | 按 hardwareId 幂等激活；重复激活更新信息并保留原 id 与令牌 | ✅ | `Db.registerDevice`、`devices` 部分唯一索引 |
+| 设备激活 | 设备令牌签发与心跳自愈 | ✅ | `Db.registerDevice`、`DeviceHeartbeat` |
 | 权限 | 后台按设备开关权限；心跳 10 s 下发；客户端页签显隐 | ✅ | `ClientPermissions`、`PermissionsHolder`、`MainActivity` |
-| 设置 | 右上角设置需管理员密码；改服务器地址；彻底退出；清除数据重新注册 | ✅ | `KioskSettingsOverlay`、`KioskSettingsViewModel` |
+| 设置 | 右上角设置需管理员密码；改服务器地址；彻底退出；清除数据重新激活 | ✅ | `KioskSettingsOverlay`、`KioskSettingsViewModel` |
 | 同步 | `config_version` 增量探测与全量同步；Room 缓存；离线降级 | ✅ | `SyncManager`、`ConfigSyncer` |
 | 同步 | 本地任务失败排队（上限 100 条）与补传 | ✅ | `SyncManager` |
 | 日志 | Room 本地缓存 + 心跳批量补传 + 服务端 `operation_logs` | ✅ | `LogRecorder`、`DeviceHeartbeat`、`Routes` |
 | 更新 | 版本检测、下载、SHA-256 校验、FileProvider 安装 | 🔶 | `AppUpdate`；无签名验签 |
 | 输入 | 内嵌数字/QWERTY 键盘，全局禁系统 IME | ✅ | `KioskKeyboard.kt`、`MainActivity` |
-| 后台 | 设备列表/在线状态/版本/修改/注销/权限 | ✅ | 后台「设备管理」、`/api/v1/devices` |
+| 后台 | 设备列表（含地区）/在线状态/版本/修改/注销/权限 | ✅ | 后台「设备管理」、`/api/v1/devices` |
+| 后台 | 单位终端统计（按单位+省份+城市汇总设备数/在线数/最近心跳） | ✅ | `GET /api/v1/devices/org-summary`、后台「设备管理」 |
 | 后台 | 用户与角色/模块权限管理、禁用、重置密码 | ✅ | `users` 表、7 个用户 API、后台「用户管理」 |
 | 后台 | 刀具/材料/零件/毛坯/工艺/图纸/校正维护 | ✅ | 后台标签页 + 配置 API |
 | 后台 | 任务记录查询 | ✅ | `/api/v1/tasks`、后台「任务记录」 |
@@ -715,7 +739,7 @@ server\build\install\cnc-server\bin\cnc-server.bat
 | 系统设置页持久化 | 🔶 | `SettingsViewModel` 仅内存 StateFlow | 重启丢失；需落 DataStore/SharedPreferences |
 | 后台操作日志查询页 | ❌ | 仅有 REST API，无前端页面 | 需用 `GET /api/v1/logs` 或数据库查看 |
 | 服务端 HTTPS / APK 签名验签 | ❌ | 全链路 HTTP；仅 SHA-256 | 中间人可篡改；建议 HTTPS + 私钥签名 |
-| 设备注销后客户端自动回注册 | ❌ | 心跳 404 仅记录 WARN，未清注册 | 需手动「清除数据重新注册」；与需求表 C15 描述不一致 |
+| 设备注销后客户端自动重新激活 | ❌ | 心跳 404 仅记录 WARN，未清激活信息 | 需手动「清除数据重新激活」；与需求表 C15 描述不一致 |
 | 多管理员/多用户登录 | ✅（Web 后台） | 已支持三角色；平板端仍无用户体系 | 平板侧权限仍按设备粒度 |
 
 ---
@@ -812,14 +836,14 @@ server\build\install\cnc-server\bin\cnc-server.bat
 - 服务端旧库迁移只增列，不删列；升级前务必备份。
 - 客户端 `fallbackToDestructiveMigration()` 在 schema 变化且未提供迁移时会清空本地缓存（配置可重新同步，任务历史可能丢失）。
 
-### 12.4 设备注销与重注册
+### 12.4 设备注销与重新激活
 
 1. 后台「设备管理」找到设备 →「注销」（`DELETE /api/v1/devices/{id}`）。
-2. 平板端：右上角设置 → 管理员密码 →「清除数据重新注册」。
-3. App 清除 `SetupPrefs` 注册信息与 `ServerPrefs` 鉴权，前台重启回到「网络 → 权限 → 注册」。
-4. 重新填写单位/联系人/电话/服务器地址完成注册。
+2. 平板端：右上角设置 → 管理员密码 →「清除数据重新激活」。
+3. App 清除 `SetupPrefs` 激活信息与 `ServerPrefs` 鉴权，前台重启回到「网络 → 权限 → 激活」。
+4. 重新填写省份/城市/单位/联系人/电话/服务器地址完成激活。
 
-> 注意：仅注销后台记录而不清平板本地数据，客户端仍会用心跳请求旧设备 ID 并收到 404；当前不会自动回注册，只会记录警告日志。
+> 注意：仅注销后台记录而不清平板本地数据，客户端仍会用心跳请求旧设备 ID 并收到 404；当前不会自动重新激活，只会记录警告日志。
 
 ---
 
@@ -835,15 +859,16 @@ server\build\install\cnc-server\bin\cnc-server.bat
 | 6 | 无暂停/继续 | 加工中只能受控停止或急停，恢复需重新开始 | 后续实现状态机级暂停与恢复资格判断 |
 | 7 | 无 PDF/OCR | 只能导入 DXF 文本/文件 | 评估 OCR 方案或要求上游提供 DXF |
 | 8 | SQLite 单文件、无自动备份 | 磁盘损坏/误删将丢失全部配置与记录 | 每日快照 + 异地备份 + 启动完整性检查 |
-| 9 | 服务端单实例、无集群 | 服务端宕机期间无法同步/注册，但加工可继续 | 现场配置备用机与快速恢复流程 |
+| 9 | 服务端单实例、无集群 | 服务端宕机期间无法同步/激活，但加工可继续 | 现场配置备用机与快速恢复流程 |
 | 10 | 客户端本地缓存可被清空 | `fallbackToDestructiveMigration` 或清数据会丢任务历史 | 关键任务记录及时上报；正式版补充 Room 迁移 |
 | 11 | 平板无工艺编辑入口 | 现场无法临时改参数，必须回后台 | 符合防误改设计；如需现场微调，应增加受控的刀补/倍率功能 |
 | 12 | 权限项未全部生效 | 后台 11 项中仅 5 项实际控制客户端显隐 | 明确产品预期；后续补齐高级页面逐项拦截 |
-| 13 | 设备注销不自动回注册 | 需人工清除数据，增加售后步骤 | 心跳 404 时自动清理并回注册（需产品确认） |
+| 13 | 设备注销不自动重新激活 | 需人工清除数据，增加售后步骤 | 心跳 404 时自动清理并重新激活（需产品确认） |
 | 14 | 管理员密码离线缓存明文 | SharedPreferences 可被 root/备份导出 | 改用加密存储；关闭 `allowBackup` 或排除敏感文件 |
 | 15 | 后台无日志查询页面 | 运维需手工调 API/查库 | 增加日志页面与导出 |
 | 16 | 无多语言 | 界面固定中文 | 海外项目需国际化改造 |
 | 17 | 无真实设备联调记录 | CAM/G-code 未在真实机床上验证 | 首台样机必须做空运行、单段、低速、全流程验收 |
+| 18 | 客户端联网判定不依赖外网可达 | 车间隔离局域网（无外网）下 `NET_CAPABILITY_VALIDATED` 可能为 false，但客户端不以它作为联网条件；只要 WiFi/有线可达服务端即可激活与心跳 | 保持按「网络已连接」判定；服务端地址与路由可达性由请求结果反馈 |
 
 ---
 
