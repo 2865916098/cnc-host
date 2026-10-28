@@ -778,8 +778,8 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 post("/admin-password") {
                     val body = call.receive<AdminPasswordUpdate>()
-                    if (body.newPassword.isBlank()) {
-                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码不能为空"))
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
                         return@post
                     }
                     // 旧接口兼容：同步更新种子超管账号，避免 users 表仍保留旧口令

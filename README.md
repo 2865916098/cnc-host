@@ -1,5 +1,7 @@
 # CNC Host — 两轴数控车床上位机（客户端 + 服务端）
 
+> 完整项目说明见 [项目文档](docs/PROJECT_DOCUMENTATION.md)，服务端接口清单见 [接口文档](docs/API.md)。
+
 面向 X/Z 两轴数控车床的加工上位机。采用 C/S 架构：
 
 - **Android 平板客户端**：傻瓜式日常操作，只做「选任务 → 预览下发 → 盯进度 → 看报警」
@@ -50,8 +52,10 @@
 客户端安装后以 Kiosk 模式运行：开机自启、始终前台、闪退自动重启、返回键/切后台被拦截。
 
 1. **网络配置**：首次启动在 App 内扫描并连接 WiFi（不跳转系统设置），联网后进入下一步
-2. **设备注册**：填写单位名称、联系人姓名、电话、服务器地址（只填 IP 即可，`http://` 与端口 8080 自动补全；也可一键自动搜索局域网内的服务端），提交后自动在后台注册，获得设备 ID 与默认全功能权限
-3. **主界面**：注册完成后进入简易模式主界面
+2. **权限引导**：引导授权悬浮窗、加入电池白名单、开启开机自启，完成后进入下一步
+3. **设备注册**：填写单位名称、联系人姓名、电话、服务器地址（只填 IP 即可，`http://` 与端口 8080 自动补全；也可一键自动搜索局域网内的服务端），提交后自动在后台注册，获得设备 ID 与默认全功能权限
+
+注册完成后进入简易模式主界面。
 
 注册信息写入本地 `SetupPrefs`，后续启动直接进入主界面。
 
@@ -73,7 +77,7 @@
 - 按设备逐项开关功能权限：任务选择、预览下发、运行监控、报警、高级模式、服务端同步、图纸、CAM、加工控制、IO、历史
 - 修改全局管理员账号密码
 
-权限通过设备心跳（每 30 秒）实时下发到客户端，对应功能入口自动显隐。90 秒无心跳的设备自动标记为离线。
+权限通过设备心跳（每 10 秒）实时下发到客户端，对应功能入口自动显隐。服务端 25 秒无心跳即判定设备离线。
 
 ## 服务端运行
 
@@ -92,6 +96,8 @@ server/build/install/cnc-server/bin/cnc-server
 | `PORT` | `8080` | HTTP 端口 |
 | `CNC_ADMIN_TOKEN` | `cnc-admin-2026` | 管理口令（REST Bearer Token） |
 | `CNC_DB` | `data/cnc-server.db` | SQLite 数据库路径 |
+| `CNC_APK` | `data/apk/cnc-host-update.apk` | 已发布 APK 的存放路径 |
+| `CNC_APK_DIR` | 见说明 | 构建产物扫描目录（Windows 下用 `;` 分隔多个）；缺省扫描 `../app/build/outputs/apk/release`、`../app/build/outputs/apk/debug`、`apk-inbox/` |
 
 地址：
 
@@ -127,8 +133,26 @@ server/build/install/cnc-server/bin/cnc-server
 | PUT | `/api/v1/devices/{id}/permissions` | 更新设备功能权限（需鉴权） |
 | POST | `/api/v1/admin-password` | 修改管理员账号密码（需鉴权） |
 
+账号、日志与版本发布接口（均需鉴权）：
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/v1/logs` | 设备批量上传操作日志（设备令牌） |
+| GET | `/api/v1/logs?deviceId=&limit=` | 管理端查询日志 |
+| DELETE | `/api/v1/logs?deviceId=&olderThanMs=` | 管理端清理日志 |
+| GET | `/api/v1/users/me` | 当前登录账号 |
+| GET | `/api/v1/users` | 用户列表 |
+| POST | `/api/v1/users` | 新建用户 |
+| PUT | `/api/v1/users/{id}` | 编辑用户 |
+| DELETE | `/api/v1/users/{id}` | 删除用户 |
+| POST | `/api/v1/users/{id}/reset-password` | 重置密码 |
+| PUT | `/api/v1/users/me/password` | 修改自己密码 |
+| GET | `/api/v1/app-latest-candidate` | 检测最新构建 APK |
+| POST | `/api/v1/app-publish-latest` | 一键发布最新构建 |
+
 除 `/health`、`/admin/login`、设备注册/查询/心跳/校验外均需 `Authorization: Bearer <会话token 或 CNC_ADMIN_TOKEN>`。
 环境变量 `CNC_ADMIN_TOKEN` 保留为部署引导令牌，日常使用管理后台账号密码登录。
+设备令牌权限最小化：仅可读配置与回传 tasks/status，禁止访问账号管理与写配置。
 
 ## 客户端连接服务端
 
@@ -177,7 +201,7 @@ app/build/outputs/apk/debug/app-debug.apk
 - Kiosk 为软件级保活（前台服务 + 看门狗 + 开机自启），无法阻止用户「强制停止」或系统 OOM 回收；如需彻底锁定需配合设备 Owner / LockTask 模式
 - 「退出软件」为彻底退出：不再被看门狗拉起，重新进入需点击桌面图标
 - 管理员密码离线校验依赖本机缓存，首次必须联网校验后才会缓存（无缓存时可用出厂默认 123456）
-- 服务端为单管理员账号（账号密码登录，会话 token 7 天有效）+ 环境变量引导令牌，设备权限按设备粒度配置，无多用户分级
+- 服务端支持多用户与角色（超级管理员/管理员/操作员），12 个模块级权限，登录会话关联用户；权限按设备粒度与后台账号粒度双重控制
 - App 内 WiFi 连接使用 WifiNetworkSpecifier：连接过程不离开本应用，但系统会弹一次「允许连接」确认框；该连接为应用级，应用彻底退出后系统可能断开该热点
 
 ## 开发上下文（AI 接手必读）
@@ -219,7 +243,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 1. **Kiosk 保活**
    - `app/src/main/java/com/cnc/host/receiver/BootReceiver.kt`：开机自启，拉起 MainActivity + KioskService
-   - `app/src/main/java/com/cnc/host/service/KioskService.kt`：前台服务，看门狗每 1500ms 检测 `MainActivity.isResumed`，不在前台且不在退出窗口则自动 `startActivity` 拉起
+   - `app/src/main/java/com/cnc/host/service/KioskService.kt`：前台服务，看门狗每 700ms 检测 `MainActivity.isResumed`，不在前台且不在退出窗口则自动 `startActivity` 拉起
    - `app/src/main/java/com/cnc/host/CncApplication.kt`：`installCrashRestartHandler` 通过 AlarmManager 1.5s 后重启 + `Process.killProcess`
    - `MainActivity` 维护 `companion object { var isResumed = false }`，`onResume`/`onPause` 置位
 
@@ -227,10 +251,10 @@ app/build/outputs/apk/debug/app-debug.apk
    - `NetworkSetupScreen`：跳转系统 WiFi/移动数据设置，「我已联网」进入下一步
    - `RegisterScreen` + `RegisterViewModel`：单位/姓名/电话/服务器地址 → `ServerApi.registerDevice` → 写 `SetupPrefs.saveIdentity`（setupCompleted=true）+ `savePermissions` + 回写 `ServerPrefs.baseUrl`
    - `SetupPrefs`（`setup/SetupPrefs.kt`）：`DeviceIdentity(setupCompleted, deviceId, unitName, contactName, phone, serverAddress, adminPassword, permissions)`，另有 `setExitWindow`/`exitUntil` 控制退出窗口
-   - `MainActivity` 启动时读 `SetupPrefs.load`，`!setupCompleted` 则渲染 NetworkSetup → Register，否则进入主界面
+   - `MainActivity` 启动时读 `SetupPrefs.load`，`!setupCompleted` 则渲染 NetworkSetup → PermissionsSetup → Register，否则进入主界面
 
 3. **后台设备管理**（服务端）
-   - `Database.kt`：`devices` 表（id, unit_name, contact_name, phone, server_address, registered_at, last_seen, online, permissions TEXT）；`meta.admin_password` 默认 `admin123`
+   - `Database.kt`：`devices` 表（id, unit_name, contact_name, phone, server_address, registered_at, last_seen, online, permissions TEXT）；`meta.admin_password` 默认 `123456`。首次启动自动创建 `users` 表并 seed 超级管理员账号（admin / 123456），老库自动迁移
    - 开放接口：`POST /api/v1/devices/register`、`GET /api/v1/devices/{id}`、`POST /api/v1/devices/{id}/heartbeat`、`POST /api/v1/devices/{id}/verify-admin`
    - 管理接口：`GET /api/v1/devices`、`PUT /api/v1/devices/{id}/permissions`、`POST /api/v1/admin-password`
    - 后台网页 `static/app.js`：设备列表、权限勾选弹窗、修改管理员密码
@@ -241,7 +265,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 5. **权限门禁**
    - `PermissionsHolder.flow`（`setup/DeviceHeartbeat.kt`）：`StateFlow<ClientPermissionsDto>`，`load`/`update`
-   - `DeviceHeartbeat.start`：每 30s 调 `ServerApi.heartbeat` 拉取 `DeviceInfoDto.permissions`，写 `SetupPrefs.savePermissions` 并 `PermissionsHolder.update`
+   - `DeviceHeartbeat.start`：每 10s 调 `ServerApi.heartbeat` 拉取 `DeviceInfoDto.permissions`，写 `SetupPrefs.savePermissions` 并 `PermissionsHolder.update`
    - `MainActivity`：底部 4 页签按 `taskSelect`/`previewStart`/`monitor`/`alarms` 过滤；「高级模式」按钮按 `advanced` 显隐
 
 ### 关键凭据（本地调试用）
