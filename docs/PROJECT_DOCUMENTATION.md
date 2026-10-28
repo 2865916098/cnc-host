@@ -274,7 +274,7 @@ cnc-host-git-baseline/
 - 键盘面板高度限定为屏幕高度的 94%，按键行用 weight 均分，横屏平板 9 键 5 行布局不会溢出。
 - `keyboardType` 为 `Number/NumberPassword/Decimal/Phone` 时默认数字页；`Ascii/Password/Uri/Email` 默认英文页；密码框回显与面板均以 `•` 掩码。
 - 当前客户端共 20 处 `KioskTextField` 调用（另有 1 处为其函数声明），覆盖激活、登录密码、IP、参数等输入。
-- 手写识别未内置：需要额外集成手写模型（APK 增大约 10–50MB），如有需要可作为二期需求。
+- 手写识别为**已确认的二期需求**：需集成离线中文手写模型（APK 预计增大约 10–50MB；Kiosk 无 GMS，只能用纯 TFLite 方案）。
 
 **用法（关键签名）**
 
