@@ -1,10 +1,27 @@
 package com.cnc.server
 
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import java.io.File
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.sql.Connection
 import java.sql.DriverManager
+import java.sql.ResultSet
+import java.util.Base64
 import java.util.UUID
+import javax.crypto.SecretKeyFactory
+import javax.crypto.spec.PBEKeySpec
+
+/** 会话 token 解析出的登录用户（权限拦截与 /users/me 使用）。 */
+data class SessionUser(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val role: String,
+    val permissions: List<String>,
+    val enabled: Boolean
+)
 
 /**
  * SQLite 数据访问层。
@@ -213,6 +230,21 @@ object Db {
                     )
                     """.trimIndent()
                 )
+                st.executeUpdate(
+                    """
+                    CREATE TABLE IF NOT EXISTS users(
+                        id TEXT PRIMARY KEY,
+                        username TEXT NOT NULL UNIQUE,
+                        password_hash TEXT NOT NULL,
+                        display_name TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        permissions TEXT NOT NULL,
+                        enabled INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        last_login_at INTEGER NOT NULL DEFAULT 0
+                    )
+                    """.trimIndent()
+                )
             }
         }
         seedIfEmpty()
@@ -229,6 +261,10 @@ object Db {
                 st.executeUpdate(
                     "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_hardware_id ON devices(hardware_id) WHERE hardware_id != ''"
                 )
+                // 用户体系迁移：会话关联用户 id（老库已存在则忽略）
+                runCatching {
+                    st.executeUpdate("ALTER TABLE admin_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+                }
             }
         }
         // 管理员账号/密码：首次启动写默认值，已存在则保留后台设置
@@ -238,6 +274,8 @@ object Db {
             // 旧版本默认密码 admin123 自动迁移为新默认 123456；用户改过的密码保留
             if (pwd == null || pwd == LEGACY_DEFAULT_ADMIN_PASSWORD) c.putMeta("admin_password", DEFAULT_ADMIN_PASSWORD)
         }
+        // 首次启动把现有管理员账号迁移为 SUPER_ADMIN 用户，保证 admin/123456 仍可登录
+        seedUsersIfEmpty()
     }
 
     fun <T> withConn(block: (Connection) -> T): T =
@@ -1009,16 +1047,57 @@ object Db {
         c.putMeta("admin_username", newUsername)
     }
 
-    /** 校验后台登录账号密码。 */
-    fun verifyAdminAccount(username: String, password: String): Boolean = withConn { c ->
-        val u = c.getMeta("admin_username") ?: DEFAULT_ADMIN_USERNAME
-        val p = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
-        u == username && p == password
+    /** 校验后台登录账号密码。优先 users 表；老库无对应用户时才回退到 meta 旧账号（兼容升级）。 */
+    fun verifyAdminAccount(username: String, password: String): Boolean {
+        if (verifyUserAccount(username, password) != null) return true
+        // users 表中已存在该账号时不再回退，避免禁用/改密后的账号被 meta 旧口令绕过
+        if (findUserByUsername(username) != null) return false
+        return withConn { c ->
+            val u = c.getMeta("admin_username") ?: DEFAULT_ADMIN_USERNAME
+            val p = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
+            u == username && p == password
+        }
     }
 
     const val DEFAULT_ADMIN_USERNAME = "admin"
     const val DEFAULT_ADMIN_PASSWORD = "123456"
     private const val LEGACY_DEFAULT_ADMIN_PASSWORD = "admin123"
+
+    // ===== 密码哈希（PBKDF2WithHmacSHA256）=====
+
+    private const val PBKDF2_ITERATIONS = 120_000
+    private const val PBKDF2_KEY_BITS = 256
+
+    /** 生成 PBKDF2 密码哈希，存储格式：pbkdf2$120000$<saltBase64>$<hashBase64>。 */
+    fun hashPassword(plain: String): String {
+        val salt = ByteArray(16).also { SecureRandom().nextBytes(it) }
+        val hash = pbkdf2(plain, salt, PBKDF2_ITERATIONS)
+        val encoder = Base64.getEncoder()
+        return "pbkdf2\$$PBKDF2_ITERATIONS\$${encoder.encodeToString(salt)}\$${encoder.encodeToString(hash)}"
+    }
+
+    /** 校验明文密码与存储哈希（常量时间比较）。 */
+    fun verifyPassword(plain: String, stored: String): Boolean {
+        val parts = stored.split('$')
+        if (parts.size != 4 || parts[0] != "pbkdf2") return false
+        val iterations = parts[1].toIntOrNull() ?: return false
+        return runCatching {
+            val salt = Base64.getDecoder().decode(parts[2])
+            val expected = Base64.getDecoder().decode(parts[3])
+            MessageDigest.isEqual(expected, pbkdf2(plain, salt, iterations))
+        }.getOrDefault(false)
+    }
+
+    private fun pbkdf2(plain: String, salt: ByteArray, iterations: Int): ByteArray {
+        // 清空口令副本，减少明文在内存中的驻留时间
+        val spec = PBEKeySpec(plain.toCharArray(), salt, iterations, PBKDF2_KEY_BITS)
+        try {
+            return SecretKeyFactory.getInstance("PBKDF2WithHmacSHA256")
+                .generateSecret(spec).encoded
+        } finally {
+            spec.clearPassword()
+        }
+    }
 
     // ===== 管理后台登录会话 =====
 
@@ -1026,7 +1105,7 @@ object Db {
     const val SESSION_TTL_MS = 7L * 24 * 3600 * 1000
 
     /** 登录成功创建会话，返回 token。 */
-    fun createSession(username: String): String = withConn { c ->
+    fun createSession(username: String, userId: String = ""): String = withConn { c ->
         // 顺手清理过期会话
         c.prepareStatement("DELETE FROM admin_sessions WHERE expires_at < ?").use { ps ->
             ps.setLong(1, System.currentTimeMillis()); ps.executeUpdate()
@@ -1034,12 +1113,13 @@ object Db {
         val token = "sess-" + UUID.randomUUID().toString().replace("-", "")
         val now = System.currentTimeMillis()
         c.prepareStatement(
-            "INSERT INTO admin_sessions(token, username, created_at, expires_at) VALUES(?,?,?,?)"
+            "INSERT INTO admin_sessions(token, username, created_at, expires_at, user_id) VALUES(?,?,?,?,?)"
         ).use { ps ->
             ps.setString(1, token)
             ps.setString(2, username)
             ps.setLong(3, now)
             ps.setLong(4, now + SESSION_TTL_MS)
+            ps.setString(5, userId)
             ps.executeUpdate()
         }
         token
@@ -1059,6 +1139,223 @@ object Db {
     fun deleteSession(token: String) = withConn { c ->
         c.prepareStatement("DELETE FROM admin_sessions WHERE token = ?").use { ps ->
             ps.setString(1, token); ps.executeUpdate()
+        }
+    }
+
+    // ===== 用户账号与权限 =====
+
+    private data class UserRow(val user: UserDto, val passwordHash: String)
+
+    private fun ResultSet.getUserRow(): UserRow = UserRow(
+        user = UserDto(
+            id = getString("id"),
+            username = getString("username"),
+            displayName = getString("display_name"),
+            role = getString("role"),
+            permissions = decodePermissionList(getString("permissions")),
+            enabled = getInt("enabled") != 0,
+            createdAt = getLong("created_at"),
+            lastLoginAt = getLong("last_login_at")
+        ),
+        passwordHash = getString("password_hash")
+    )
+
+    private fun decodePermissionList(raw: String): List<String> =
+        runCatching { json.decodeFromString<List<String>>(raw) }.getOrDefault(emptyList())
+
+    private fun encodePermissionList(list: List<String>): String = json.encodeToString(list)
+
+    fun listUsers(): List<UserDto> = withConn { c ->
+        c.prepareStatement("SELECT * FROM users ORDER BY created_at, username").use { ps ->
+            ps.executeQuery().use { rs ->
+                buildList { while (rs.next()) add(rs.getUserRow().user) }
+            }
+        }
+    }
+
+    fun findUserByUsername(username: String): UserDto? = withConn { c ->
+        c.prepareStatement("SELECT * FROM users WHERE username = ?").use { ps ->
+            ps.setString(1, username)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow().user else null }
+        }
+    }
+
+    fun findUserById(id: String): UserDto? = withConn { c ->
+        c.prepareStatement("SELECT * FROM users WHERE id = ?").use { ps ->
+            ps.setString(1, id)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow().user else null }
+        }
+    }
+
+    fun createUser(
+        username: String,
+        password: String,
+        displayName: String,
+        role: String,
+        permissions: List<String>
+    ): UserDto {
+        val name = username.trim()
+        require(name.isNotEmpty()) { "用户名不能为空" }
+        val id = UUID.randomUUID().toString()
+        val now = System.currentTimeMillis()
+        withConn { c ->
+            val exists = c.prepareStatement("SELECT 1 FROM users WHERE username = ?").use { ps ->
+                ps.setString(1, name)
+                ps.executeQuery().use { rs -> rs.next() }
+            }
+            if (exists) throw IllegalArgumentException("用户名已存在")
+            try {
+                c.prepareStatement(
+                    """
+                    INSERT INTO users(id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
+                    VALUES(?,?,?,?,?,?,?,?,0)
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.setString(1, id)
+                    ps.setString(2, name)
+                    ps.setString(3, hashPassword(password))
+                    ps.setString(4, displayName.ifBlank { name })
+                    ps.setString(5, role)
+                    ps.setString(6, encodePermissionList(permissions))
+                    ps.setInt(7, 1)
+                    ps.setLong(8, now)
+                    ps.executeUpdate()
+                }
+            } catch (e: java.sql.SQLException) {
+                // 并发创建时唯一索引冲突同样按「用户名已存在」处理
+                if (e.message?.contains("UNIQUE", ignoreCase = true) == true) {
+                    throw IllegalArgumentException("用户名已存在")
+                }
+                throw e
+            }
+        }
+        return findUserById(id) ?: throw IllegalStateException("创建用户失败")
+    }
+
+    fun updateUser(
+        id: String,
+        displayName: String,
+        role: String,
+        permissions: List<String>,
+        enabled: Boolean
+    ): UserDto? {
+        val changed = withConn { c ->
+            c.prepareStatement(
+                "UPDATE users SET display_name = ?, role = ?, permissions = ?, enabled = ? WHERE id = ?"
+            ).use { ps ->
+                ps.setString(1, displayName)
+                ps.setString(2, role)
+                ps.setString(3, encodePermissionList(permissions))
+                ps.setInt(4, if (enabled) 1 else 0)
+                ps.setString(5, id)
+                ps.executeUpdate()
+            }
+        }
+        return if (changed > 0) findUserById(id) else null
+    }
+
+    fun deleteUser(id: String): Boolean = withConn { c ->
+        // 同步清理该用户的会话（含老版本 user_id 为空、仅按用户名关联的会话）
+        c.prepareStatement(
+            "DELETE FROM admin_sessions WHERE user_id = ? OR (user_id = '' AND username = (SELECT username FROM users WHERE id = ?))"
+        ).use { ps ->
+            ps.setString(1, id)
+            ps.setString(2, id)
+            ps.executeUpdate()
+        }
+        c.prepareStatement("DELETE FROM users WHERE id = ?").use { ps ->
+            ps.setString(1, id)
+            ps.executeUpdate() > 0
+        }
+    }
+
+    /** 删除某用户的全部会话（改密后强制重新登录）。 */
+    fun deleteUserSessions(userId: String, username: String): Int = withConn { c ->
+        c.prepareStatement(
+            "DELETE FROM admin_sessions WHERE user_id = ? OR (user_id = '' AND username = ?)"
+        ).use { ps ->
+            ps.setString(1, userId)
+            ps.setString(2, username)
+            ps.executeUpdate()
+        }
+    }
+
+    fun resetUserPassword(id: String, newPassword: String): Boolean = withConn { c ->
+        c.prepareStatement("UPDATE users SET password_hash = ? WHERE id = ?").use { ps ->
+            ps.setString(1, hashPassword(newPassword))
+            ps.setString(2, id)
+            ps.executeUpdate() > 0
+        }
+    }
+
+    fun changeOwnPassword(id: String, oldPassword: String, newPassword: String): Boolean {
+        val row = withConn { c ->
+            c.prepareStatement("SELECT * FROM users WHERE id = ?").use { ps ->
+                ps.setString(1, id)
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow() else null }
+            }
+        } ?: return false
+        if (!verifyPassword(oldPassword, row.passwordHash)) return false
+        return resetUserPassword(id, newPassword)
+    }
+
+    fun countSuperAdmins(): Int = withConn { c ->
+        c.prepareStatement("SELECT COUNT(*) FROM users WHERE role = 'SUPER_ADMIN'").use { ps ->
+            ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) }
+        }
+    }
+
+    /** 账号密码校验（仅启用用户），成功后刷新最后登录时间。 */
+    fun verifyUserAccount(username: String, password: String): SessionUser? {
+        val row = withConn { c ->
+            c.prepareStatement("SELECT * FROM users WHERE username = ?").use { ps ->
+                ps.setString(1, username)
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow() else null }
+            }
+        } ?: return null
+        val user = row.user
+        if (!user.enabled || !verifyPassword(password, row.passwordHash)) return null
+        withConn { c ->
+            c.prepareStatement("UPDATE users SET last_login_at = ? WHERE id = ?").use { ps ->
+                ps.setLong(1, System.currentTimeMillis())
+                ps.setString(2, user.id)
+                ps.executeUpdate()
+            }
+        }
+        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, true)
+    }
+
+    /** 会话 token → 关联用户；老会话 user_id 为空时按用户名反查。 */
+    fun getSessionUser(token: String): SessionUser? {
+        if (token.isBlank()) return null
+        val row = withConn { c ->
+            c.prepareStatement(
+                "SELECT user_id, username FROM admin_sessions WHERE token = ? AND expires_at >= ?"
+            ).use { ps ->
+                ps.setString(1, token)
+                ps.setLong(2, System.currentTimeMillis())
+                ps.executeQuery().use { rs ->
+                    if (rs.next()) rs.getString("user_id") to rs.getString("username") else null
+                }
+            }
+        } ?: return null
+        val user = if (row.first.isNotBlank()) findUserById(row.first) else findUserByUsername(row.second)
+        if (user == null || !user.enabled) return null
+        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, user.enabled)
+    }
+
+    /** 兼容旧「管理员账号密码」设置：同步更新种子超管账号，避免旧口令继续可用。 */
+    fun syncLegacyAdminAccount(oldUsername: String, newUsername: String, newPassword: String): Boolean {
+        if (oldUsername.isBlank()) return false
+        return withConn { c ->
+            c.prepareStatement(
+                "UPDATE users SET username = ?, password_hash = ? WHERE role = 'SUPER_ADMIN' AND username = ?"
+            ).use { ps ->
+                ps.setString(1, newUsername)
+                ps.setString(2, hashPassword(newPassword))
+                ps.setString(3, oldUsername)
+                ps.executeUpdate() > 0
+            }
         }
     }
 
@@ -1096,6 +1393,34 @@ object Db {
                 seedPlans(c)
                 seedDrawings(c)
                 seedTasks(c)
+            }
+        }
+    }
+
+    /** 空用户表时，把 meta 中的管理员账号迁移为 SUPER_ADMIN，保证老账号仍可登录。 */
+    private fun seedUsersIfEmpty() {
+        withConn { c ->
+            val count = c.createStatement().use { st ->
+                st.executeQuery("SELECT COUNT(*) FROM users").use { rs -> rs.next(); rs.getInt(1) }
+            }
+            if (count > 0) return@withConn
+            val username = c.getMeta("admin_username") ?: DEFAULT_ADMIN_USERNAME
+            val password = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
+            c.prepareStatement(
+                """
+                INSERT INTO users(id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
+                VALUES(?,?,?,?,?,?,?,?,0)
+                """.trimIndent()
+            ).use { ps ->
+                ps.setString(1, UUID.randomUUID().toString())
+                ps.setString(2, username)
+                ps.setString(3, hashPassword(password))
+                ps.setString(4, "超级管理员")
+                ps.setString(5, "SUPER_ADMIN")
+                ps.setString(6, "[]")
+                ps.setInt(7, 1)
+                ps.setLong(8, System.currentTimeMillis())
+                ps.executeUpdate()
             }
         }
     }

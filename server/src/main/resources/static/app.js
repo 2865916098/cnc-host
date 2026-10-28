@@ -13,7 +13,10 @@
     status: null,
     tab: "overview",
     ws: null,
-    devicesTimer: null
+    devicesTimer: null,
+    user: null,
+    users: [],
+    usersLoaded: false
   };
 
   const $ = (id) => document.getElementById(id);
@@ -68,6 +71,17 @@
       S.username = data.username || username;
       localStorage.setItem("cnc_token", S.token);
       localStorage.setItem("cnc_user", S.username);
+      // 旧后端不返回角色/权限字段时保持 null，交给 loadMe 统一降级
+      S.user = data.role ? {
+        id: null,
+        username: S.username,
+        displayName: data.displayName || S.username,
+        role: data.role,
+        permissions: Array.isArray(data.permissions) ? data.permissions : [],
+        superAdmin: data.role === "SUPER_ADMIN"
+      } : null;
+      await loadMe();
+      if (!S.token) return;
       enterApp();
       await loadAll();
       connectWs();
@@ -76,8 +90,32 @@
     }
   }
 
+  // 当前登录用户：/users/me 未就绪时降级，避免登录流程中断
+  async function loadMe() {
+    try {
+      const me = await api("/api/v1/users/me");
+      S.user = {
+        id: me.id,
+        username: me.username || S.username,
+        displayName: me.displayName || me.username || S.username,
+        role: me.role || "",
+        permissions: Array.isArray(me.permissions) ? me.permissions : [],
+        superAdmin: !!(me.superAdmin || me.role === "SUPER_ADMIN")
+      };
+    } catch (e) {
+      if (!S.token) return; // 401 已被 logout 处理
+      if (!S.user) {
+        S.user = { superAdmin: true, role: "SUPER_ADMIN", permissions: [], username: S.username, displayName: S.username };
+      }
+    }
+    renderNav();
+  }
+
   function enterApp() {
-    $("current-user").textContent = S.username || "-";
+    const u = S.user || {};
+    const name = u.displayName || u.username || S.username || "-";
+    const role = u.role ? "（" + (ROLE_LABELS[u.role] || u.role) + "）" : "";
+    $("current-user").textContent = name + role;
     $("login").style.display = "none";
     $("app").style.display = "block";
   }
@@ -91,6 +129,10 @@
     localStorage.removeItem("cnc_user");
     S.token = "";
     S.username = "";
+    S.user = null;
+    S.users = [];
+    S.usersLoaded = false;
+    S.tab = "overview";
     if (S.ws) { try { S.ws.close(); } catch (_) {} S.ws = null; }
     $("app").style.display = "none";
     $("login").style.display = "flex";
@@ -124,6 +166,22 @@
     }).join("");
   }
 
+  // ===== 权限 =====
+  const ROLE_LABELS = { SUPER_ADMIN: "超级管理员", ADMIN: "管理员", OPERATOR: "操作员" };
+  const MODULE_LABELS = {
+    overview: "概览", device: "设备与通讯", tools: "刀具库", materials: "材料库",
+    parts: "零件与毛坯", plans: "工艺方案", drawings: "图纸任务", devices: "设备管理",
+    tasks: "任务记录", users: "用户管理", app: "客户端发布"
+  };
+  const USER_MODULES = Object.keys(MODULE_LABELS);
+
+  function can(perm) {
+    const u = S.user;
+    if (!u) return true; // 未知时宽松，避免空白后台
+    if (u.superAdmin || u.role === "SUPER_ADMIN") return true;
+    return (u.permissions || []).includes(perm);
+  }
+
   // ===== 导航 =====
   const TABS = [
     { id: "overview", label: "概览", sub: "配置版本与设备实时状态" },
@@ -134,22 +192,31 @@
     { id: "plans", label: "工艺方案", sub: "工序步骤与切削参数", count: (c) => c.plans.length },
     { id: "drawings", label: "图纸任务", sub: "DXF 原文与尺寸校正，客户端据此生成刀路", count: (c) => c.drawings.length },
     { id: "devices", label: "设备管理", sub: "注册设备、在线状态与功能权限", count: () => S.devices.length },
-    { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length }
+    { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length },
+    { id: "users", label: "用户管理", sub: "后台账号、角色与模块权限分配", count: () => S.users ? S.users.length : "" }
   ];
 
+  function visibleTabs() {
+    return TABS.filter((t) => t.id === "overview" || can(t.id));
+  }
+
   function renderNav() {
-    $("nav").innerHTML = TABS.map((t) => {
-      const n = t.count ? t.count(S.config) : "";
+    const tabs = visibleTabs();
+    if (!tabs.some((t) => t.id === S.tab)) S.tab = "overview";
+    $("nav").innerHTML = tabs.map((t) => {
+      const n = t.count && S.config ? t.count(S.config) : "";
       return `<div class="nav-item ${S.tab === t.id ? "active" : ""}" onclick="switchTab('${t.id}')">
         <span>${esc(t.label)}</span><span class="count">${n}</span></div>`;
     }).join("");
   }
 
   window.switchTab = function (id) {
+    if (id !== "overview" && !can(id)) { toast("没有该模块的访问权限", true); return; }
     S.tab = id;
     renderNav();
     render();
     if (id === "devices") startDevicesPolling(); else stopDevicesPolling();
+    if (id === "users") loadUsers();
   };
 
   // ===== 设备页自动刷新：注册/心跳变化 3 秒内可见 =====
@@ -173,6 +240,7 @@
   }
 
   function render() {
+    if (!visibleTabs().some((t) => t.id === S.tab)) S.tab = "overview";
     const t = TABS.find((x) => x.id === S.tab);
     $("page-title").textContent = t.label;
     $("page-sub").textContent = t.sub;
@@ -186,9 +254,11 @@
       plans: viewPlans,
       drawings: viewDrawings,
       devices: viewDevices,
-      tasks: viewTasks
+      tasks: viewTasks,
+      users: viewUsers
     };
-    $("content").innerHTML = views[S.tab](c);
+    const view = views[S.tab] || viewOverview;
+    $("content").innerHTML = view(c);
   }
 
   // ===== 概览 =====
@@ -852,6 +922,194 @@
     });
   };
 
+  // ===== 用户管理 =====
+  const USER_ROLES = [
+    { v: "SUPER_ADMIN", label: "超级管理员" },
+    { v: "ADMIN", label: "管理员" },
+    { v: "OPERATOR", label: "操作员" }
+  ];
+
+  function findUser(id) {
+    return (S.users || []).find((u) => String(u.id) === String(id));
+  }
+
+  function isSelfUser(u) {
+    const me = S.user || {};
+    if (!u) return false;
+    if (me.id != null && u.id != null) return String(me.id) === String(u.id);
+    return !!me.username && u.username === me.username;
+  }
+
+  function roleLabel(role) { return ROLE_LABELS[role] || role || "-"; }
+
+  function userPermTags(u) {
+    if (u.superAdmin || u.role === "SUPER_ADMIN") return `<span class="tag on">全部权限</span>`;
+    const perms = u.permissions || [];
+    if (!perms.length) return `<span class="muted">无</span>`;
+    return `<div class="perm-tags">${perms.map((k) => `<span class="tag">${esc(MODULE_LABELS[k] || k)}</span>`).join("")}</div>`;
+  }
+
+  function viewUsers() {
+    const rows = (S.users || []).map((u) => {
+      const self = isSelfUser(u);
+      const selfTip = self ? ` disabled title="不能操作当前登录账号"` : "";
+      const actions =
+        `<button class="small" onclick="openUserEdit('${jsStr(u.id)}')">编辑</button>
+         <button class="small" onclick="resetUserPassword('${jsStr(u.id)}','${jsStr(u.username)}')">重置密码</button>
+         <button class="small"${selfTip} onclick="toggleUserEnabled('${jsStr(u.id)}',${u.enabled ? "true" : "false"})">${u.enabled ? "禁用" : "启用"}</button>
+         <button class="small danger"${selfTip} onclick="deleteUser('${jsStr(u.id)}','${jsStr(u.username)}')">删除</button>`;
+      return `<tr>
+        <td><code>${esc(u.username)}</code>${self ? ` <span class="user-flag">（当前）</span>` : ""}</td>
+        <td>${esc(u.displayName || "-")}</td>
+        <td>${esc(roleLabel(u.role))}</td>
+        <td>${userPermTags(u)}</td>
+        <td>${tag(u.enabled ? "启用" : "禁用", !!u.enabled)}</td>
+        <td class="muted">${fmtTime(u.lastLoginAt)}</td>
+        <td class="actions">${actions}</td>
+      </tr>`;
+    });
+    return `
+      <div class="hint-box">后台账号按模块授权，左侧菜单只显示已授权的模块。超级管理员拥有全部权限；不能禁用或删除当前登录账号，且需至少保留一个启用的超级管理员。</div>
+      <div class="panel"><h3>后台用户 <button class="primary small" onclick="openUserCreate()">新建用户</button></h3>
+        ${table(["用户名", "姓名", "角色", "权限", "状态", "最后登录", "操作"], rows,
+          S.usersLoaded ? "暂无用户数据，点击「新建用户」添加。" : "正在加载用户列表…")}</div>`;
+  }
+
+  async function loadUsers() {
+    try {
+      const list = await api("/api/v1/users");
+      S.users = Array.isArray(list) ? list : [];
+      S.usersLoaded = true;
+    } catch (e) {
+      if (S.token) toast(e.message, true);
+    }
+    renderNav();
+    if (S.tab === "users") render();
+  }
+
+  function userPermCheckboxes(perms) {
+    const set = perms || [];
+    return USER_MODULES.map((k) => {
+      const checked = set.includes(k) ? " checked" : "";
+      return `<label class="perm-item"><input type="checkbox" data-mperm="${k}"${checked}> ${esc(MODULE_LABELS[k])}</label>`;
+    }).join("");
+  }
+
+  function collectUserPerms() {
+    return Array.from($("modal-body").querySelectorAll("input[data-mperm]"))
+      .filter((el) => el.checked)
+      .map((el) => el.dataset.mperm);
+  }
+
+  window.openUserCreate = function () {
+    openModal("新建用户", `
+      <div class="form-row">
+        <div class="field"><label>用户名（登录账号）</label><input id="u_username" autocomplete="off"></div>
+        <div class="field"><label>姓名</label><input id="u_displayName"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>初始密码</label><input id="u_password" type="password" autocomplete="new-password"></div>
+        <div class="field"><label>角色</label><select id="u_role">${optionList(USER_ROLES, "v", (x) => x.label, "OPERATOR")}</select></div>
+      </div>
+      <div class="form-label" style="margin-top:4px">模块权限</div>
+      <div class="perm-grid">${userPermCheckboxes(["overview"])}</div>
+      <div class="desc" style="margin-top:10px">超级管理员自动拥有全部权限；其他角色按勾选模块显示左侧菜单。</div>`,
+      async () => {
+        const username = $("u_username").value.trim();
+        const password = $("u_password").value;
+        if (!username) throw new Error("用户名不能为空");
+        if (!password) throw new Error("密码不能为空");
+        await api("/api/v1/users", { method: "POST", body: {
+          username,
+          password,
+          displayName: $("u_displayName").value.trim(),
+          role: $("u_role").value,
+          permissions: collectUserPerms()
+        } });
+        toast("用户已创建");
+        await loadUsers();
+      }, true);
+  };
+
+  window.openUserEdit = function (id) {
+    const u = findUser(id);
+    if (!u) { toast("用户不存在，请刷新列表", true); return; }
+    const self = isSelfUser(u);
+    openModal("编辑用户：" + u.username, `
+      <div class="form-row">
+        <div class="field"><label>用户名（不可修改）</label><input value="${esc(u.username)}" disabled></div>
+        <div class="field"><label>姓名</label><input id="u_displayName" value="${esc(u.displayName || "")}"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>角色${self ? "（不能修改自己的角色）" : ""}</label>
+          <select id="u_role"${self ? " disabled" : ""}>${optionList(USER_ROLES, "v", (x) => x.label, u.role)}</select></div>
+        <div class="field"><label class="check" style="margin-top:20px">
+          <input type="checkbox" id="u_enabled"${u.enabled ? " checked" : ""}${self ? " disabled" : ""}> 启用该账号</label></div>
+      </div>
+      <div class="form-label" style="margin-top:4px">模块权限</div>
+      <div class="perm-grid">${userPermCheckboxes(u.permissions)}</div>`,
+      async () => {
+        await api("/api/v1/users/" + encodeURIComponent(id), { method: "PUT", body: {
+          displayName: $("u_displayName").value.trim(),
+          role: self ? u.role : $("u_role").value,
+          permissions: collectUserPerms(),
+          enabled: self ? !!u.enabled : $("u_enabled").checked
+        } });
+        toast("用户已更新");
+        await loadUsers();
+      }, true);
+  };
+
+  window.resetUserPassword = async function (id, username) {
+    const pwd = prompt(`请输入「${username}」的新密码（至少 6 位）`);
+    if (pwd == null) return;
+    if (!pwd.trim()) { toast("密码不能为空", true); return; }
+    try {
+      const data = await api("/api/v1/users/" + encodeURIComponent(id) + "/reset-password", {
+        method: "POST", body: { newPassword: pwd }
+      });
+      toast((data && data.message) || "密码已重置");
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.toggleUserEnabled = async function (id, enabled) {
+    const u = findUser(id);
+    if (u && isSelfUser(u)) { toast("不能禁用当前登录账号", true); return; }
+    try {
+      await api("/api/v1/users/" + encodeURIComponent(id), { method: "PUT", body: { enabled: !enabled } });
+      toast(enabled ? "用户已禁用" : "用户已启用");
+      await loadUsers();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.deleteUser = async function (id, username) {
+    const u = findUser(id);
+    if (u && isSelfUser(u)) { toast("不能删除当前登录账号", true); return; }
+    if (!confirm(`确认删除用户「${username}」？删除后该账号将无法登录。`)) return;
+    try {
+      const data = await api("/api/v1/users/" + encodeURIComponent(id), { method: "DELETE" });
+      toast((data && data.message) || "用户已删除");
+      await loadUsers();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.changeMyPassword = function () {
+    openModal("修改密码", `
+      <div class="field"><label>当前密码</label><input id="p_old" type="password" autocomplete="current-password"></div>
+      <div class="field" style="margin-top:12px"><label>新密码</label><input id="p_new" type="password" autocomplete="new-password"></div>
+      <div class="field" style="margin-top:12px"><label>确认新密码</label><input id="p_new2" type="password" autocomplete="new-password"></div>
+      <div class="desc" style="margin-top:10px">修改成功后需要重新登录。</div>`,
+      async () => {
+        const oldPassword = $("p_old").value;
+        const newPassword = $("p_new").value;
+        if (!oldPassword || !newPassword) throw new Error("请填写当前密码与新密码");
+        if (newPassword !== $("p_new2").value) throw new Error("两次输入的新密码不一致");
+        await api("/api/v1/users/me/password", { method: "PUT", body: { oldPassword, newPassword } });
+        toast("密码已修改，请重新登录");
+        setTimeout(() => logout("密码已修改，请重新登录"), 900);
+      }, true);
+  };
+
   // ===== 删除 =====
   window.delEntity = async function (resource, id, label) {
     if (!confirm("确认删除该" + label + "？此操作会立即影响已同步的平板。")) return;
@@ -864,17 +1122,20 @@
 
   // ===== 弹窗 =====
   let modalSaveHandler = null;
+  let modalReload = true;
 
-  function openModal(title, bodyHtml, onSave) {
+  function openModal(title, bodyHtml, onSave, noReload) {
     $("modal-title").textContent = title;
     $("modal-body").innerHTML = bodyHtml;
     modalSaveHandler = onSave;
+    modalReload = !noReload;
     $("modal-mask").classList.add("show");
   }
 
   function closeModal() {
     $("modal-mask").classList.remove("show");
     modalSaveHandler = null;
+    modalReload = true;
   }
 
   $("modal-close").onclick = closeModal;
@@ -885,8 +1146,9 @@
     btn.disabled = true;
     try {
       await modalSaveHandler();
+      const reload = modalReload;
       closeModal();
-      await loadAll();
+      if (reload) await loadAll();
     } catch (e) {
       toast(e.message, true);
     } finally {
@@ -926,8 +1188,13 @@
   $("username").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
   $("logout-btn").onclick = () => logout("已退出登录");
   $("logout-btn2").onclick = () => logout("已退出登录");
+  if ($("change-pwd-btn")) $("change-pwd-btn").onclick = () => changeMyPassword();
   $("refresh-btn").onclick = async () => {
-    try { await loadAll(); toast("已刷新"); } catch (e) { toast(e.message, true); }
+    try {
+      await loadAll();
+      if (S.tab === "users") await loadUsers();
+      toast("已刷新");
+    } catch (e) { toast(e.message, true); }
   };
 
   // 启动
@@ -939,6 +1206,8 @@
     if (S.token) {
       try {
         await api("/api/v1/auth/check");
+        await loadMe();
+        if (!S.token) return;
         enterApp();
         await loadAll();
         connectWs();

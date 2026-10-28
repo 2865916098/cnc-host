@@ -317,7 +317,72 @@ data class AdminLoginResult(
     val message: String = "",
     val token: String = "",
     val username: String = "",
-    val expiresAt: Long = 0L
+    val expiresAt: Long = 0L,
+    val role: String = "",
+    val permissions: List<String> = emptyList(),
+    val displayName: String = ""
+)
+
+// ===================== 后台用户账号与权限 =====================
+
+/**
+ * 用户角色：
+ * - SUPER_ADMIN 超级管理员（不受权限列表限制）
+ * - ADMIN       管理员（按 permissions 授权）
+ * - OPERATOR    操作员（按 permissions 授权）
+ */
+const val ROLE_SUPER_ADMIN = "SUPER_ADMIN"
+const val ROLE_ADMIN = "ADMIN"
+const val ROLE_OPERATOR = "OPERATOR"
+
+/**
+ * 可授权模块 key（前后端统一）：
+ * overview, device, tools, materials, parts, plans, drawings,
+ * devices, tasks, users, app, logs
+ */
+@Serializable
+data class UserDto(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val role: String,
+    val permissions: List<String> = emptyList(),
+    val enabled: Boolean,
+    val createdAt: Long,
+    val lastLoginAt: Long = 0
+)
+
+@Serializable
+data class CreateUserRequest(
+    val username: String,
+    val password: String,
+    val displayName: String = "",
+    val role: String = "OPERATOR",
+    val permissions: List<String> = emptyList()
+)
+
+@Serializable
+data class UpdateUserRequest(
+    val displayName: String? = null,
+    val role: String? = null,
+    val permissions: List<String>? = null,
+    val enabled: Boolean? = null
+)
+
+@Serializable
+data class ResetPasswordRequest(val newPassword: String)
+
+@Serializable
+data class ChangePasswordRequest(val oldPassword: String, val newPassword: String)
+
+@Serializable
+data class SessionUserDto(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val role: String,
+    val permissions: List<String>,
+    val superAdmin: Boolean
 )
 
 // ===================== 操作日志 =====================

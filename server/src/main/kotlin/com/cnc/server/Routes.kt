@@ -6,6 +6,8 @@ import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.application.log
@@ -16,6 +18,8 @@ import io.ktor.server.plugins.callloging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.server.request.receive
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.response.header
@@ -57,6 +61,56 @@ private fun sha256Of(file: File): String {
         }
     }
     return digest.digest().joinToString("") { "%02x".format(it) }
+}
+
+/** 当前请求的 Bearer token。 */
+private fun ApplicationCall.bearerToken(): String =
+    request.headers[HttpHeaders.Authorization].orEmpty().removePrefix("Bearer").trim()
+
+/** 管理端操作者：环境变量口令 / 设备令牌视为超管虚拟账号。 */
+private data class AdminActor(
+    val id: String,
+    val username: String,
+    val role: String,
+    val isSuper: Boolean
+)
+
+private fun adminActorOf(call: ApplicationCall, adminToken: String): AdminActor? {
+    val token = call.bearerToken()
+    if (token == adminToken || Db.isValidDeviceToken(token)) {
+        return AdminActor(id = "", username = Db.adminUsername(), role = ROLE_SUPER_ADMIN, isSuper = true)
+    }
+    val user = Db.getSessionUser(token) ?: return null
+    return AdminActor(user.id, user.username, user.role, user.role == ROLE_SUPER_ADMIN)
+}
+
+private val USER_ROLES = setOf(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_OPERATOR)
+
+/**
+ * 管理端「方法 + 路径」权限映射；返回 null 表示所有已登录用户可访问。
+ * 模块 key 与前端导航一致：overview/device/tools/materials/parts/plans/
+ * drawings/devices/tasks/users/app/logs。
+ */
+private fun requiredPermission(method: String, path: String): String? {
+    val p = path.substringAfter("/api/v1", path)
+    return when {
+        // 查看本人信息 / 修改本人密码属于基础能力，不受 users 模块权限限制
+        p == "/users/me" || p == "/users/me/password" -> null
+        p.contains("/users") || p.contains("/admin-password") -> "users"
+        p.contains("/app-publish") || p.contains("/app-latest-candidate") -> "app"
+        p.contains("/materials") -> "materials"
+        p.contains("/parts") || p.contains("/blanks") -> "parts"
+        p.contains("/plans") || p.contains("/process-steps") -> "plans"
+        p.contains("/drawings") || p.contains("/corrections") -> "drawings"
+        p.contains("/tools") -> "tools"
+        p.contains("/devices") -> "devices"
+        p.contains("/tasks") -> "tasks"
+        p.contains("/logs") -> "logs"
+        method == "PUT" && p == "/device" -> "device"
+        p == "/config" || p.startsWith("/config/") ||
+            p == "/auth/check" || p == "/status" || p == "/admin/logout" -> null
+        else -> null
+    }
 }
 
 /**
@@ -152,14 +206,19 @@ fun Application.cncServerModule(adminToken: String) {
             post("/admin/login") {
                 val req = call.receive<AdminLoginRequest>()
                 if (Db.verifyAdminAccount(req.username, req.password)) {
-                    val token = Db.createSession(req.username)
+                    // users 表中存在该账号时带出角色/权限；老库回退登录时按超管处理
+                    val account = Db.findUserByUsername(req.username)
+                    val token = Db.createSession(req.username, account?.id ?: "")
                     call.respond(
                         AdminLoginResult(
                             ok = true,
                             message = "登录成功",
                             token = token,
                             username = req.username,
-                            expiresAt = System.currentTimeMillis() + Db.SESSION_TTL_MS
+                            expiresAt = System.currentTimeMillis() + Db.SESSION_TTL_MS,
+                            role = account?.role ?: ROLE_SUPER_ADMIN,
+                            permissions = account?.permissions ?: emptyList(),
+                            displayName = account?.displayName ?: req.username
                         )
                     )
                 } else {
@@ -246,6 +305,235 @@ fun Application.cncServerModule(adminToken: String) {
 
         authenticate("admin") {
             route("/api/v1") {
+                // ===== 权限拦截：环境变量口令 / 设备令牌放行；超管放行；其余按模块授权 =====
+                intercept(ApplicationCallPipeline.Call) {
+                    val token = call.bearerToken()
+                    if (token == adminToken) return@intercept
+                    if (Db.isValidDeviceToken(token)) {
+                        // 设备令牌权限最小化：仅允许读配置 + 回传任务记录/实时状态，禁止账号管理与写配置
+                        val m = call.request.httpMethod.value
+                        val p = call.request.path()
+                        val allowed = (m == "GET" && !p.contains("/users") && !p.contains("/admin-password")) ||
+                            (m == "POST" && (p.endsWith("/tasks") || p.endsWith("/status")))
+                        if (!allowed) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌仅允许同步配置与回传数据"))
+                            finish()
+                        }
+                        return@intercept
+                    }
+                    // 会话仍有效但账号被禁用/删除时，getSessionUser 返回 null，必须拒绝
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        finish()
+                        return@intercept
+                    }
+                    if (user.role == ROLE_SUPER_ADMIN) return@intercept
+                    val method = call.request.httpMethod.value
+                    val path = call.request.path()
+                    val required = requiredPermission(method, path) ?: return@intercept
+                    val allowed = if (method == "GET" && !path.contains("/users")) {
+                        // 只读请求对已登录用户宽松放行（账号管理除外）
+                        user.permissions.isNotEmpty()
+                    } else {
+                        user.permissions.contains(required)
+                    }
+                    if (!allowed) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        finish()
+                    }
+                }
+
+                // ===== 当前账号 =====
+                get("/users/me") {
+                    val token = call.bearerToken()
+                    if (Db.isValidDeviceToken(token)) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌无权访问账号管理"))
+                        return@get
+                    }
+                    if (token == adminToken) {
+                        call.respond(
+                            SessionUserDto(
+                                id = "", username = Db.adminUsername(), displayName = "超级管理员",
+                                role = ROLE_SUPER_ADMIN, permissions = emptyList(), superAdmin = true
+                            )
+                        )
+                        return@get
+                    }
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        return@get
+                    }
+                    call.respond(
+                        SessionUserDto(
+                            id = user.id, username = user.username, displayName = user.displayName,
+                            role = user.role, permissions = user.permissions,
+                            superAdmin = user.role == ROLE_SUPER_ADMIN
+                        )
+                    )
+                }
+
+                // ===== 用户管理 =====
+                get("/users") {
+                    call.respond(Db.listUsers())
+                }
+
+                post("/users") {
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val body = call.receive<CreateUserRequest>()
+                    if (body.username.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "用户名不能为空"))
+                        return@post
+                    }
+                    if (body.password.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@post
+                    }
+                    if (body.role !in USER_ROLES) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "无效的角色"))
+                        return@post
+                    }
+                    if (body.role == ROLE_SUPER_ADMIN && !actor.isSuper) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@post
+                    }
+                    val result = runCatching {
+                        Db.createUser(body.username.trim(), body.password, body.displayName, body.role, body.permissions)
+                    }
+                    val error = result.exceptionOrNull()
+                    if (error is IllegalArgumentException) {
+                        call.respond(HttpStatusCode.Conflict, SimpleResult(ok = false, message = error.message ?: "用户名已存在"))
+                        return@post
+                    }
+                    call.respond(result.getOrElse { throw it })
+                }
+
+                // 改本人密码：需在 /users/{id} 之前注册；成功后强制重新登录
+                put("/users/me/password") {
+                    val token = call.bearerToken()
+                    if (token == adminToken || Db.isValidDeviceToken(token)) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "当前登录方式无需修改密码"))
+                        return@put
+                    }
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        return@put
+                    }
+                    val body = call.receive<ChangePasswordRequest>()
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@put
+                    }
+                    if (!Db.changeOwnPassword(user.id, body.oldPassword, body.newPassword)) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "原密码错误"))
+                        return@put
+                    }
+                    Db.deleteUserSessions(user.id, user.username)
+                    call.respond(SimpleResult(ok = true, message = "密码已修改，请重新登录"))
+                }
+
+                put("/users/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@put call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id)
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@put
+                    }
+                    val body = call.receive<UpdateUserRequest>()
+                    // 非超管不能修改超管账号，也不能把普通账号提升为超管
+                    if (!actor.isSuper && (target.role == ROLE_SUPER_ADMIN || body.role == ROLE_SUPER_ADMIN)) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@put
+                    }
+                    val newRole = body.role ?: target.role
+                    if (newRole !in USER_ROLES) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "无效的角色"))
+                        return@put
+                    }
+                    if (body.enabled == false && actor.id == id) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "不能禁用自己"))
+                        return@put
+                    }
+                    if (target.role == ROLE_SUPER_ADMIN &&
+                        (newRole != ROLE_SUPER_ADMIN || body.enabled == false) &&
+                        Db.countSuperAdmins() <= 1
+                    ) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
+                        return@put
+                    }
+                    val updated = Db.updateUser(
+                        id = id,
+                        displayName = body.displayName?.ifBlank { target.displayName } ?: target.displayName,
+                        role = newRole,
+                        permissions = body.permissions ?: target.permissions,
+                        enabled = body.enabled ?: target.enabled
+                    )
+                    if (updated == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                    } else {
+                        call.respond(updated)
+                    }
+                }
+
+                delete("/users/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@delete call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id)
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@delete
+                    }
+                    if (actor.id == id) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "不能删除自己"))
+                        return@delete
+                    }
+                    if (!actor.isSuper && target.role == ROLE_SUPER_ADMIN) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@delete
+                    }
+                    if (target.role == ROLE_SUPER_ADMIN && Db.countSuperAdmins() <= 1) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
+                        return@delete
+                    }
+                    if (!Db.deleteUser(id)) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                    } else {
+                        call.respond(SimpleResult(ok = true, message = "用户已删除"))
+                    }
+                }
+
+                post("/users/{id}/reset-password") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id)
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@post
+                    }
+                    if (!actor.isSuper && target.role == ROLE_SUPER_ADMIN) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@post
+                    }
+                    val body = call.receive<ResetPasswordRequest>()
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@post
+                    }
+                    if (!Db.resetUserPassword(id, body.newPassword)) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@post
+                    }
+                    Db.deleteUserSessions(target.id, target.username)
+                    call.respond(SimpleResult(ok = true, message = "密码已重置"))
+                }
+
                 get("/auth/check") {
                     call.respond(SimpleResult(ok = true, message = "token valid"))
                 }
@@ -494,7 +782,15 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码不能为空"))
                         return@post
                     }
-                    if (body.newUsername.isNotBlank()) Db.setAdminUsername(body.newUsername.trim())
+                    // 旧接口兼容：同步更新种子超管账号，避免 users 表仍保留旧口令
+                    val oldUsername = Db.adminUsername()
+                    val newUsername = body.newUsername.trim().ifBlank { oldUsername }
+                    val sync = runCatching { Db.syncLegacyAdminAccount(oldUsername, newUsername, body.newPassword) }
+                    if (sync.isFailure) {
+                        call.respond(HttpStatusCode.Conflict, SimpleResult(ok = false, message = "用户名已存在"))
+                        return@post
+                    }
+                    Db.setAdminUsername(newUsername)
                     Db.setAdminPassword(body.newPassword)
                     call.respond(SimpleResult(ok = true, message = "管理员账号密码已更新"))
                 }

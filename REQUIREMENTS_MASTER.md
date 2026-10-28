@@ -60,7 +60,8 @@
 | REQ-C13 | 版本发布默认最新 APK 一键发布（2026-10-28 指令 N8） | ✅ | AxmlVersionReader（二进制 AXML 解析 versionCode/versionName）+ ApkScanner 扫描构建目录；/app-latest-candidate + /app-publish-latest；后台「一键发布」按钮，手动上传折叠兜底 | 待验收（服务端跑一遍发布） |
 | REQ-C14 | 屏幕常亮（工业平板加工现场阻塞缺口） | ✅ | MainActivity 加 FLAG_KEEP_SCREEN_ON | 待真机验收 |
 | REQ-C15 | 设备被后台注销后自动回注册（现场运维链路） | ✅ | 心跳收到 404 → 清本地注册+鉴权 → 前台重启回注册流程 | 待真机验收 |
-| REQ-C16 | 操作日志服务端闭环（A15 缺口修复） | ✅ | 服务端 operation_logs 表 + POST/GET/DELETE 三个 API；客户端 Room 本地缓存 + 心跳 10s 自动补传；8 处关键路径埋点（加工启动/完成/急停、心跳、APK 更新、清除数据、应用启动） | 待验收 |
+| REQ-C16 | 操作日志服务端闭环（A15 缺口修复） | ✅ | 服务端 operation_logs 表 + POST/GET/DELETE 三个 API；客户端 Room 本地缓存 + 心跳 10s 自动补传；8 处关键路径埋点（加工启动/完成/急停、心跳、APK 更新、清除数据、应用启动） | 已 curl 验证 |
+| REQ-C17 | 后台全套用户与权限管理（2026-10-28 追加需求） | ✅ | users 表（PBKDF2 密码哈希、角色 SUPER_ADMIN/ADMIN/OPERATOR、模块级 permissions）；7 个用户 API；登录响应带角色权限；路由级权限拦截；后台「用户管理」页（列表/新建/编辑/重置密码/禁用/删除）+ 菜单按权限显隐 + 右上角改密码 | 已端到端验证 28 项；旧库自动 seed 超管 admin/123456 |
 
 ## D 系列：修改/替换记录【正式/会话混合】
 
