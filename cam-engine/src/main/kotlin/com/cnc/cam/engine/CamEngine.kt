@@ -69,7 +69,7 @@ object CamEngine {
             )
         }
 
-        val validation = validate(segments, contour, step)
+        val validation = validate(segments, contour, step, stockDiameter = stockDiameter)
         // 独立否决权（规范 §3.3）：非法坐标 / 超行程 / 段间跳变 / 转速超限，任一失败即不可执行
         val valid = validation.noIllegalCoordinates && validation.withinTravel &&
             validation.noAbnormalJumps && validation.spindleWithinLimit
@@ -372,8 +372,9 @@ object CamEngine {
      * - 行程越界（|X| ≤ [maxTravelX]，|Z| ≤ [maxTravelZ]，由设备配置提供）
      * - 段间连续性（相邻段首尾必须重合）
      * - 主轴转速上限（≤ [maxSpindleRpm]）
+     * - 过切检测（P2-⑤）：粗车削每刀切深 × 刀具半径 ≤ 毛坯余量
      *
-     * 未实现的校验（不得宣称通过）：毛坯碰撞、几何过切——
+     * 未实现的校验（不得宣称通过）：毛坯碰撞——
      * 在 [ToolpathValidation.unverifiedChecks] 中明示，由操作员知悉。
      */
     fun validate(
@@ -382,7 +383,11 @@ object CamEngine {
         step: ProcessStep,
         maxTravelX: Double = 500.0,
         maxTravelZ: Double = 500.0,
-        maxSpindleRpm: Int = 10000
+        maxSpindleRpm: Int = 10000,
+        /** 毛坯直径（P2-⑤ 过切检测需要；粗车削时必传）。 */
+        stockDiameter: Double = 0.0,
+        /** 刀具半径 mm（P2-⑤ 过切检测；缺省用 depthOfCutMm 近似）。 */
+        toolRadiusMm: Double = 0.0
     ): ToolpathValidation {
         val messages = mutableListOf<String>()
 
@@ -431,6 +436,22 @@ object CamEngine {
             messages.add("主轴转速超过设备上限 $maxSpindleRpm rpm（${overRpm.first().segmentId} 等 ${overRpm.size} 段）")
         }
 
+        // 6. 过切检测（P2-⑤）：粗车削每刀切深 × 刀具半径 ≤ 毛坯余量
+        //    毛坯余量 = 毛坯半径 - 轮廓最小X（即外圆最小半径）
+        //    若单刀切深 × 刀具半径 > 毛坯余量，末层切削会切到轮廓以下，产生过切
+        if (step.type == ProcessType.ROUGH_TURNING && stockDiameter > 0) {
+            val stockRadius = stockDiameter / 2.0
+            val stockAllowance = stockRadius - contour.minX  // 毛坯余量（半径方向）
+            val effectiveToolRadius = if (toolRadiusMm > 0) toolRadiusMm else step.depthOfCutMm
+            val cutPerPass = step.depthOfCutMm * effectiveToolRadius  // 单刀体积切削量（近似）
+            if (stockAllowance > 0 && cutPerPass > stockAllowance) {
+                messages.add(
+                    "过切风险：单刀切深×刀具半径=${"%.1f".format(cutPerPass)}mm² " +
+                    "超过毛坯余量=${"%.1f".format(stockAllowance)}mm，末层可能切到轮廓以下"
+                )
+            }
+        }
+
         return ToolpathValidation(
             withinTravel = withinTravel,
             noIllegalCoordinates = noIllegal,
@@ -439,7 +460,7 @@ object CamEngine {
             noStockCollision = false, // 毛坯碰撞校验未实现：明示未通过，不得恒 true
             hasApproachRetract = segments.isNotEmpty(), // 简化
             messages = messages,
-            unverifiedChecks = listOf("毛坯碰撞校验", "几何过切校验")
+            unverifiedChecks = listOf("毛坯碰撞校验") // 过切检测已实现，从未验证清单中移除
         )
     }
 

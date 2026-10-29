@@ -207,6 +207,67 @@ class CamEngineTest {
         assertTrue(tp.valid)
     }
 
+    // ==================== 过切检测（P2-⑤） ====================
+    // makeSimpleContour().minX = 20；makeStep().depthOfCutMm = 2.0
+    // 触发条件：粗车削且 depthOfCutMm × 刀具半径 > 毛坯半径 - minX
+
+    @Test
+    fun `overcut risk is flagged when cut per pass exceeds stock allowance`() {
+        // 毛坯直径 41 → 半径 20.5，余量仅 0.5mm；切深×刀径 = 2.0×2.0 = 4.0 > 0.5 → 报警告
+        val seg = makeFeedSeg("cut", Point2D(20.5, 50.0), Point2D(20.5, 10.0))
+        val v = CamEngine.validate(
+            listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING),
+            stockDiameter = 41.0
+        )
+        assertTrue(v.messages.any { it.contains("过切") })
+    }
+
+    @Test
+    fun `no overcut warning when stock allowance is sufficient`() {
+        // 毛坯直径 60 → 半径 30，余量 10mm；切深×刀径 = 4.0 < 10 → 不报警告
+        val seg = makeFeedSeg("cut", Point2D(30.0, 50.0), Point2D(20.0, 10.0))
+        val v = CamEngine.validate(
+            listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING),
+            stockDiameter = 60.0
+        )
+        assertFalse(v.messages.any { it.contains("过切") })
+    }
+
+    @Test
+    fun `overcut check only applies to rough turning`() {
+        // 同样参数下精车削不做该项检测
+        val seg = makeFeedSeg("cut", Point2D(20.5, 50.0), Point2D(20.5, 10.0))
+        val v = CamEngine.validate(
+            listOf(seg), makeSimpleContour(), makeStep(ProcessType.FINISH_TURNING),
+            stockDiameter = 41.0
+        )
+        assertFalse(v.messages.any { it.contains("过切") })
+    }
+
+    @Test
+    fun `overcut detection uses explicit tool radius when provided`() {
+        // 显式刀径 5.0：切深×刀径 = 2.0×5.0 = 10.0；毛坯 59 → 半径 29.5 → 余量 9.5 < 10 → 触发
+        val seg = makeFeedSeg("cut", Point2D(29.5, 50.0), Point2D(20.0, 10.0))
+        val v = CamEngine.validate(
+            listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING),
+            stockDiameter = 59.0, toolRadiusMm = 5.0
+        )
+        assertTrue(v.messages.any { it.contains("过切") })
+    }
+
+    @Test
+    fun `generate passes stock diameter to validator for overcut check`() {
+        // 全流程：毛坯直径 41（余量仅 0.5mm）时粗车削刀路必须带过切警告
+        val tp = CamEngine.generate(
+            makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING),
+            stockDiameter = 41.0, stockLength = 50.0,
+            processPlanId = "pp-oc", toolNumber = 1
+        )
+        assertTrue(tp.validation.messages.any { it.contains("过切") })
+        // 过切为提示性警告，不影响已实现校验项的通过判定
+        assertTrue(tp.valid)
+    }
+
     private fun makeFeedSeg(id: String, start: Point2D, end: Point2D) = com.cnc.model.cam.ToolpathSegment(
         segmentId = id,
         motionType = com.cnc.model.cam.MotionType.LINEAR_FEED,
