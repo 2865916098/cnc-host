@@ -349,20 +349,41 @@ data class AdminLoginResult(
 // ===================== 后台用户账号与权限 =====================
 
 /**
- * 用户角色：
- * - SUPER_ADMIN 超级管理员（不受权限列表限制）
- * - ADMIN       管理员（按 permissions 授权）
- * - OPERATOR    操作员（按 permissions 授权）
+ * 用户角色（机床行业惯例五角色，ADR-0003）：
+ * - SUPER_ADMIN      超级管理员（系统所有者/实施方，不受权限列表限制）
+ * - ADMIN            管理员（厂长/车间管理员，全部业务模块）
+ * - PROCESS_ENGINEER 工艺员（刀具/材料/零件/工艺/图纸 读写）
+ * - OPERATOR         操作员（概览/本机设备/任务执行回传）
+ * - QUALITY          质检员（任务/日志 只读）
  */
 const val ROLE_SUPER_ADMIN = "SUPER_ADMIN"
 const val ROLE_ADMIN = "ADMIN"
+const val ROLE_PROCESS_ENGINEER = "PROCESS_ENGINEER"
 const val ROLE_OPERATOR = "OPERATOR"
+const val ROLE_QUALITY = "QUALITY"
 
-/**
- * 可授权模块 key（前后端统一）：
- * overview, device, tools, materials, parts, plans, drawings,
- * devices, tasks, users, app, logs
- */
+/** 全部可授权模块 key（前后端统一）。 */
+val ALL_MODULE_PERMISSIONS: List<String> = listOf(
+    "overview", "device", "tools", "materials", "parts", "plans",
+    "drawings", "devices", "tasks", "users", "app", "logs"
+)
+
+/** 各角色默认模块权限（创建用户未显式指定 permissions 时使用）。 */
+fun defaultPermissionsForRole(role: String): List<String> = when (role) {
+    ROLE_SUPER_ADMIN -> emptyList()          // 超管绕过权限列表
+    ROLE_ADMIN -> ALL_MODULE_PERMISSIONS
+    ROLE_PROCESS_ENGINEER -> listOf("overview", "tools", "materials", "parts", "plans", "drawings")
+    ROLE_OPERATOR -> listOf("overview", "device", "tasks")
+    ROLE_QUALITY -> listOf("overview", "tasks", "logs")
+    else -> emptyList()
+}
+
+/** 只读角色：对这些模块仅放行 GET/HEAD，写操作一律拒绝。 */
+fun readOnlyModulesForRole(role: String): Set<String> = when (role) {
+    ROLE_QUALITY -> setOf("tasks", "logs")
+    else -> emptySet()
+}
+
 @Serializable
 data class UserDto(
     val id: String,

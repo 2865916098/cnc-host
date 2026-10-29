@@ -1459,6 +1459,8 @@ object Db {
     ): UserDto {
         val name = username.trim()
         require(name.isNotEmpty()) { "用户名不能为空" }
+        // 未显式指定权限时按角色默认权限填充（ADR-0003）
+        val effectivePermissions = permissions.ifEmpty { defaultPermissionsForRole(role) }
         val id = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
         withConn { c ->
@@ -1481,7 +1483,7 @@ object Db {
                     ps.setString(4, hashPassword(password))
                     ps.setString(5, displayName.ifBlank { name })
                     ps.setString(6, role)
-                    ps.setString(7, encodePermissionList(permissions))
+                    ps.setString(7, encodePermissionList(effectivePermissions))
                     ps.setInt(8, 1)
                     ps.setLong(9, now)
                     ps.executeUpdate()

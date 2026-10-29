@@ -170,11 +170,19 @@
   }
 
   // ===== 权限 =====
-  const ROLE_LABELS = { SUPER_ADMIN: "超级管理员", ADMIN: "管理员", OPERATOR: "操作员" };
+  const ROLE_LABELS = { SUPER_ADMIN: "超级管理员", ADMIN: "管理员", PROCESS_ENGINEER: "工艺员", OPERATOR: "操作员", QUALITY: "质检员" };
   const MODULE_LABELS = {
     overview: "概览", device: "设备与通讯", tools: "刀具库", materials: "材料库",
     parts: "零件与毛坯", plans: "工艺方案", drawings: "图纸任务", devices: "设备管理",
-    tasks: "任务记录", users: "用户管理", app: "客户端发布"
+    tasks: "任务记录", users: "用户管理", app: "客户端发布", logs: "操作日志"
+  };
+  // 角色默认模块权限（ADR-0003），新建/切换角色时自动勾选，仍可手工调整
+  const ROLE_DEFAULT_PERMS = {
+    SUPER_ADMIN: [],
+    ADMIN: Object.keys(MODULE_LABELS),
+    PROCESS_ENGINEER: ["overview", "tools", "materials", "parts", "plans", "drawings"],
+    OPERATOR: ["overview", "device", "tasks"],
+    QUALITY: ["overview", "tasks", "logs"]
   };
   const USER_MODULES = Object.keys(MODULE_LABELS);
 
@@ -1000,8 +1008,17 @@
   const USER_ROLES = [
     { v: "SUPER_ADMIN", label: "超级管理员" },
     { v: "ADMIN", label: "管理员" },
-    { v: "OPERATOR", label: "操作员" }
+    { v: "PROCESS_ENGINEER", label: "工艺员" },
+    { v: "OPERATOR", label: "操作员" },
+    { v: "QUALITY", label: "质检员" }
   ];
+
+  function applyRoleDefaultPerms(role) {
+    const set = new Set(ROLE_DEFAULT_PERMS[role] || []);
+    $("modal-body").querySelectorAll("input[data-mperm]").forEach((el) => {
+      el.checked = set.has(el.dataset.mperm);
+    });
+  }
 
   function findUser(id) {
     return (S.users || []).find((u) => String(u.id) === String(id));
@@ -1083,11 +1100,11 @@
       </div>
       <div class="form-row">
         <div class="field"><label>初始密码</label><input id="u_password" type="password" autocomplete="new-password"></div>
-        <div class="field"><label>角色</label><select id="u_role">${optionList(USER_ROLES, "v", (x) => x.label, "OPERATOR")}</select></div>
+        <div class="field"><label>角色</label><select id="u_role" onchange="applyRoleDefaultPerms(this.value)">${optionList(USER_ROLES, "v", (x) => x.label, "OPERATOR")}</select></div>
       </div>
       <div class="form-label" style="margin-top:4px">模块权限</div>
-      <div class="perm-grid">${userPermCheckboxes(["overview"])}</div>
-      <div class="desc" style="margin-top:10px">超级管理员自动拥有全部权限；其他角色按勾选模块显示左侧菜单。</div>`,
+      <div class="perm-grid">${userPermCheckboxes(["overview", "device", "tasks"])}</div>
+      <div class="desc" style="margin-top:10px">超级管理员自动拥有全部权限；切换角色会按岗位默认勾选模块，可手工微调。</div>`,
       async () => {
         const username = $("u_username").value.trim();
         const password = $("u_password").value;
@@ -1116,7 +1133,7 @@
       </div>
       <div class="form-row">
         <div class="field"><label>角色${self ? "（不能修改自己的角色）" : ""}</label>
-          <select id="u_role"${self ? " disabled" : ""}>${optionList(USER_ROLES, "v", (x) => x.label, u.role)}</select></div>
+          <select id="u_role"${self ? " disabled" : ""} onchange="applyRoleDefaultPerms(this.value)">${optionList(USER_ROLES, "v", (x) => x.label, u.role)}</select></div>
         <div class="field"><label class="check" style="margin-top:20px">
           <input type="checkbox" id="u_enabled"${u.enabled ? " checked" : ""}${self ? " disabled" : ""}> 启用该账号</label></div>
       </div>

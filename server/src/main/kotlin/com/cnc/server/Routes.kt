@@ -88,7 +88,7 @@ private fun adminActorOf(call: ApplicationCall, adminToken: String): AdminActor?
     return AdminActor(user.id, user.username, user.role, user.role == ROLE_SUPER_ADMIN)
 }
 
-private val USER_ROLES = setOf(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_OPERATOR)
+private val USER_ROLES = setOf(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_PROCESS_ENGINEER, ROLE_OPERATOR, ROLE_QUALITY)
 
 /**
  * 管理端「方法 + 路径」权限映射；返回 null 表示所有已登录用户可访问。
@@ -372,6 +372,13 @@ fun Application.cncServerModule(adminToken: String) {
                     if (!user.permissions.contains(required)) {
                         call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
                         finish()
+                        return@intercept
+                    }
+                    // ADR-0003：只读角色（如质检员）对已授权模块仅放行 GET/HEAD，写操作一律拒绝
+                    if (readOnlyModulesForRole(user.role).contains(required) && method != "GET" && method != "HEAD") {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "该角色对该模块仅有只读权限"))
+                        finish()
+                        return@intercept
                     }
                 }
 
