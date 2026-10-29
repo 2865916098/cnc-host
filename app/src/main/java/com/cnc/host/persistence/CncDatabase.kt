@@ -32,7 +32,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         SyncMetaEntity::class,
         com.cnc.host.logging.OperationLogEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -111,6 +111,15 @@ abstract class CncDatabase : RoomDatabase() {
             }
         }
 
+        /** v5 → v6：task_history 新增 state 列（P2-③ 任务状态机），老记录用 status 回填。 */
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE task_history ADD COLUMN state TEXT NOT NULL DEFAULT 'SUCCESS'")
+                // 把历史 status 值回填到 state
+                db.execSQL("UPDATE task_history SET state = status WHERE state = 'SUCCESS'")
+            }
+        }
+
         @Volatile
         private var INSTANCE: CncDatabase? = null
 
@@ -126,7 +135,7 @@ abstract class CncDatabase : RoomDatabase() {
                 CncDatabase::class.java,
                 DB_NAME
             )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
                 .fallbackToDestructiveMigration()   // 开发期 schema 变更可接受 destructive 重建
                 .allowMainThreadQueries()           // 开发期允许（ViewModel 里先读）；生产改用 suspend/Flow
                 .build()

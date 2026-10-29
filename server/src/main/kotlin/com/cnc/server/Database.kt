@@ -197,6 +197,7 @@ object Db {
                         partName TEXT NOT NULL,
                         planId TEXT NOT NULL,
                         status TEXT NOT NULL,
+                        state TEXT NOT NULL DEFAULT 'SUCCESS',
                         durationSec REAL NOT NULL,
                         operator TEXT NOT NULL,
                         startedAt INTEGER NOT NULL,
@@ -288,6 +289,12 @@ object Db {
                 // 用户体系迁移：会话关联用户 id（老库已存在则忽略）
                 runCatching {
                     st.executeUpdate("ALTER TABLE admin_sessions ADD COLUMN user_id TEXT NOT NULL DEFAULT ''")
+                }
+                // 任务状态机（P2-③）：task_history 增加 state 列，老记录用 status 回填
+                runCatching {
+                    st.executeUpdate("ALTER TABLE task_history ADD COLUMN state TEXT NOT NULL DEFAULT 'SUCCESS'")
+                    // 把历史 status 值回填到 state（老记录只有 status 没有 state）
+                    st.executeUpdate("UPDATE task_history SET state = status WHERE state = 'SUCCESS'")
                 }
             }
         }
@@ -489,6 +496,8 @@ object Db {
                 ps.setString(13, saved.notes)
                 ps.executeUpdate()
             }
+            // Revision 失效链：刀具变更 → 引用该刀具的工艺方案关联的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, planIdsUsingTool(c, id, tenantId), tenantId)
             c.bumpVersion()
         }
         saved
@@ -546,6 +555,8 @@ object Db {
                 ps.setString(11, saved.notes)
                 ps.executeUpdate()
             }
+            // Revision 失效链：材料变更 → 使用该材料的零件关联工艺方案的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, planIdsUsingMaterial(c, id, tenantId), tenantId)
             c.bumpVersion()
         }
         saved
@@ -586,6 +597,8 @@ object Db {
                 ps.setString(5, saved.notes)
                 ps.executeUpdate()
             }
+            // Revision 失效链：零件变更 → 该零件关联工艺方案的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, planIdsUsingPart(c, id, tenantId), tenantId)
             c.bumpVersion()
         }
         saved
@@ -631,6 +644,8 @@ object Db {
                 ps.setString(7, saved.clampType)
                 ps.executeUpdate()
             }
+            // Revision 失效链：毛坯变更 → 该毛坯所属零件关联工艺方案的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, planIdsUsingBlank(c, id, tenantId), tenantId)
             c.bumpVersion()
         }
         saved
@@ -747,6 +762,8 @@ object Db {
                     ps.executeUpdate()
                 }
             }
+            // Revision 失效链：工艺方案变更 → 直接引用该方案的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, listOf(id), tenantId)
             c.bumpVersion()
         }
         saved
@@ -804,6 +821,8 @@ object Db {
                 ps.setString(7, saved.dxfContent)
                 ps.executeUpdate()
             }
+            // Revision 失效链：图纸变更 → 以该图纸为工艺依据（planId = 图纸 id）的非终态任务重置为待审
+            invalidateTasksForPlansConn(c, listOf(id), tenantId)
             c.bumpVersion()
         }
         saved
@@ -881,6 +900,7 @@ object Db {
                             partName = rs.getString("partName"),
                             planId = rs.getString("planId"),
                             status = rs.getString("status"),
+                            state = rs.getString("state"),
                             durationSec = rs.getDouble("durationSec"),
                             operator = rs.getString("operator"),
                             startedAt = rs.getLong("startedAt"),
@@ -913,6 +933,7 @@ object Db {
                             partName = rs.getString("partName"),
                             planId = rs.getString("planId"),
                             status = rs.getString("status"),
+                            state = rs.getString("state"),
                             durationSec = rs.getDouble("durationSec"),
                             operator = rs.getString("operator"),
                             startedAt = rs.getLong("startedAt"),
@@ -940,26 +961,117 @@ object Db {
         }
     }
 
-    fun upsertTask(task: TaskRecord, tenantId: String = DEFAULT_TENANT): TaskRecord = withConn { c ->
-        val id = task.id.ifBlank { "task-${UUID.randomUUID().toString().take(8)}" }
-        val saved = task.copy(id = id)
-        c.prepareStatement(
-            """
-            INSERT OR REPLACE INTO task_history(
-                id, tenant_id, partName, planId, status, durationSec, operator, startedAt, finishedAt
-            ) VALUES(?,?,?,?,?,?,?,?,?)
-            """.trimIndent()
+    /**
+     * Revision 失效链（P2-③ / R8）：当工艺相关实体变更时，把依赖该实体的非终态任务
+     * 重置为 PENDING_REVIEW，提示工艺员/操作员重新审核。
+     *
+     * @param planIds 受影响的工艺方案 id 集合；任务的 planId 命中其中即被重置
+     * @return 被重置的任务数
+     */
+    fun invalidateTasksForPlans(planIds: Collection<String>, tenantId: String = DEFAULT_TENANT): Int =
+        withConn { c -> invalidateTasksForPlansConn(c, planIds, tenantId) }
+
+    /** 连接内版本：供 upsert* 在同一事务中调用，保证原子性。 */
+    private fun invalidateTasksForPlansConn(c: Connection, planIds: Collection<String>, tenantId: String): Int {
+        if (planIds.isEmpty()) return 0
+        val placeholders = planIds.joinToString(",") { "?" }
+        val terminal = TASK_TERMINAL_STATES.joinToString(",") { "'$it'" }
+        return c.prepareStatement(
+            "UPDATE task_history SET state = ? WHERE tenant_id = ? AND state NOT IN ($terminal) AND planId IN ($placeholders)"
         ).use { ps ->
-            ps.setString(1, id)
-            ps.setString(2, tenantId)
-            ps.setString(3, saved.partName)
-            ps.setString(4, saved.planId)
-            ps.setString(5, saved.status)
-            ps.setDouble(6, saved.durationSec)
-            ps.setString(7, saved.operator)
-            ps.setLong(8, saved.startedAt)
-            ps.setLong(9, saved.finishedAt)
+            var i = 1
+            ps.setString(i++, TASK_STATE_PENDING_REVIEW)
+            ps.setString(i++, tenantId)
+            planIds.forEach { ps.setString(i++, it) }
             ps.executeUpdate()
+        }
+    }
+
+    /** 单 planId 快捷版。 */
+    fun invalidateTaskForPlan(planId: String, tenantId: String = DEFAULT_TENANT): Int =
+        invalidateTasksForPlans(listOf(planId), tenantId)
+
+    // ===== 受影响 planId 查询（revision 失效链辅助）=====
+
+    /** 引用该刀具的工艺方案 id 列表。 */
+    private fun planIdsUsingTool(c: Connection, toolId: String, tenantId: String): List<String> =
+        c.prepareStatement("SELECT DISTINCT planId FROM process_steps WHERE tenant_id = ? AND toolId = ?").use { ps ->
+            ps.setString(1, tenantId); ps.setString(2, toolId)
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
+        }
+
+    /** 引用该材料的零件对应的工艺方案 id 列表。 */
+    private fun planIdsUsingMaterial(c: Connection, materialId: String, tenantId: String): List<String> =
+        c.prepareStatement(
+            "SELECT DISTINCT pp.id FROM process_plans pp WHERE pp.tenant_id = ? AND pp.partId IN (" +
+                "SELECT p.id FROM parts p WHERE p.tenant_id = ? AND p.materialId = ?)"
+        ).use { ps ->
+            ps.setString(1, tenantId); ps.setString(2, tenantId); ps.setString(3, materialId)
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
+        }
+
+    /** 该零件对应的工艺方案 id 列表。 */
+    private fun planIdsUsingPart(c: Connection, partId: String, tenantId: String): List<String> =
+        c.prepareStatement("SELECT id FROM process_plans WHERE tenant_id = ? AND partId = ?").use { ps ->
+            ps.setString(1, tenantId); ps.setString(2, partId)
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
+        }
+
+    /** 该毛坯所属零件对应的工艺方案 id 列表。 */
+    private fun planIdsUsingBlank(c: Connection, blankId: String, tenantId: String): List<String> =
+        c.prepareStatement(
+            "SELECT pp.id FROM process_plans pp WHERE pp.tenant_id = ? AND pp.partId = " +
+                "(SELECT partId FROM blanks WHERE id = ? AND tenant_id = ?)"
+        ).use { ps ->
+            ps.setString(1, tenantId); ps.setString(2, blankId); ps.setString(3, tenantId)
+            ps.executeQuery().use { rs -> buildList { while (rs.next()) add(rs.getString(1)) } }
+        }
+
+    /**
+     * 新增/更新任务记录，并执行状态机迁移校验。
+     *
+     * - state 缺省回退 status（兼容旧客户端）
+     * - 已存在记录：校验 oldState → newState 迁移合法，否则抛 IllegalArgumentException
+     * - 终态记录不允许被改写（同态幂等除外）
+     */
+    fun upsertTask(task: TaskRecord, tenantId: String = DEFAULT_TENANT): TaskRecord = withConn { c ->
+        val newState = task.effectiveState
+        require(isValidTaskState(newState)) { "非法任务状态：$newState" }
+
+        val id = task.id.ifBlank { "task-${UUID.randomUUID().toString().take(8)}" }
+        // 查询已有状态以校验迁移
+        val existingState = c.prepareStatement(
+            "SELECT state FROM task_history WHERE id = ? AND tenant_id = ?"
+        ).use { ps ->
+            ps.setString(1, id); ps.setString(2, tenantId)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getString("state") else null }
+        }
+        if (existingState != null && !isValidTaskTransition(existingState, newState)) {
+            throw IllegalArgumentException("非法任务状态迁移：$existingState → $newState")
+        }
+
+        // status 与 state 保持一致（兼容旧客户端只读 status）
+        val saved = task.copy(id = id, status = newState, state = newState)
+        c.tx {
+            c.prepareStatement(
+                """
+                INSERT OR REPLACE INTO task_history(
+                    id, tenant_id, partName, planId, status, state, durationSec, operator, startedAt, finishedAt
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                """.trimIndent()
+            ).use { ps ->
+                ps.setString(1, id)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.partName)
+                ps.setString(4, saved.planId)
+                ps.setString(5, saved.status)
+                ps.setString(6, saved.state)
+                ps.setDouble(7, saved.durationSec)
+                ps.setString(8, saved.operator)
+                ps.setLong(9, saved.startedAt)
+                ps.setLong(10, saved.finishedAt)
+                ps.executeUpdate()
+            }
         }
         saved
     }
@@ -1956,16 +2068,17 @@ object Db {
     private fun seedTasks(c: Connection) {
         val now = System.currentTimeMillis()
         val tasks = listOf(
-            TaskRecord("srv-h1", "主轴接套", "srv-pp1", "SUCCESS", 312.5, "操作员A", now - 7_200_000, now - 6_887_500),
-            TaskRecord("srv-h2", "液压阀芯", "srv-pp2", "FAILED", 120.3, "操作员B", now - 172_800_000, now - 172_679_700)
+            TaskRecord("srv-h1", "主轴接套", "srv-pp1", "SUCCESS", "SUCCESS", 312.5, "操作员A", now - 7_200_000, now - 6_887_500),
+            TaskRecord("srv-h2", "液压阀芯", "srv-pp2", "FAILED", "FAILED", 120.3, "操作员B", now - 172_800_000, now - 172_679_700)
         )
         tasks.forEach { t ->
             c.prepareStatement(
-                "INSERT OR REPLACE INTO task_history(id, tenant_id, partName, planId, status, durationSec, operator, startedAt, finishedAt) VALUES(?,?,?,?,?,?,?,?,?)"
+                "INSERT OR REPLACE INTO task_history(id, tenant_id, partName, planId, status, state, durationSec, operator, startedAt, finishedAt) VALUES(?,?,?,?,?,?,?,?,?,?)"
             ).use { ps ->
                 ps.setString(1, t.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, t.partName)
-                ps.setString(4, t.planId); ps.setString(5, t.status); ps.setDouble(6, t.durationSec)
-                ps.setString(7, t.operator); ps.setLong(8, t.startedAt); ps.setLong(9, t.finishedAt)
+                ps.setString(4, t.planId); ps.setString(5, t.status); ps.setString(6, t.state)
+                ps.setDouble(7, t.durationSec); ps.setString(8, t.operator)
+                ps.setLong(9, t.startedAt); ps.setLong(10, t.finishedAt)
                 ps.executeUpdate()
             }
         }

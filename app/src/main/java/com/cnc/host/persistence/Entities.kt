@@ -144,7 +144,9 @@ data class TaskHistoryEntity(
     @PrimaryKey val id: String,
     val partName: String,
     val planId: String,
-    val status: String,     // SUCCESS / FAILED / ABORTED
+    val status: String,     // SUCCESS / FAILED / ABORTED（兼容旧字段）
+    /** 生命周期状态（P2-③）：PENDING_REVIEW / READY / RUNNING / SUCCESS / FAILED / ABORTED */
+    val state: String = "SUCCESS",
     val durationSec: Double,
     val operator: String,
     val startedAt: Long,

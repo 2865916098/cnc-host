@@ -59,9 +59,9 @@ object SeedData {
 
     // ===== 任务历史（首次启动时自动写几条） =====
     val taskHistory = listOf(
-        TaskHistoryEntity("h1", "主轴接套", "pp-1", "SUCCESS", 312.5, "操作员A",
+        TaskHistoryEntity("h1", "主轴接套", "pp-1", "SUCCESS", "SUCCESS", 312.5, "操作员A",
             System.currentTimeMillis() - 7200000, System.currentTimeMillis() - 6887500),
-        TaskHistoryEntity("h2", "液压阀芯", "pp-2", "FAILED", 120.3, "操作员B",
+        TaskHistoryEntity("h2", "液压阀芯", "pp-2", "FAILED", "FAILED", 120.3, "操作员B",
             System.currentTimeMillis() - 172800000, System.currentTimeMillis() - 172679700)
     )
 }

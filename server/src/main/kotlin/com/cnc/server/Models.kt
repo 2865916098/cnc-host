@@ -140,17 +140,84 @@ data class DrawingCorrectionConfig(
     val unit: String = "MM"
 )
 
+// ===================== 任务状态机（P2-③ / R8）=====================
+
+/**
+ * 任务生命周期状态（ADR-0003 配套，机床行业惯例）：
+ * PENDING_REVIEW(待审) → READY(就绪) → RUNNING(执行中) → SUCCESS(完成)/FAILED(失败)/ABORTED(中止)
+ *
+ * - 终态：SUCCESS / FAILED / ABORTED，一旦进入不可回退
+ * - 配置实体（刀具/材料/零件/毛坯/工艺/图纸）变更时，依赖其的非终态任务被重置为 PENDING_REVIEW
+ */
+const val TASK_STATE_PENDING_REVIEW = "PENDING_REVIEW"
+const val TASK_STATE_READY = "READY"
+const val TASK_STATE_RUNNING = "RUNNING"
+const val TASK_STATE_SUCCESS = "SUCCESS"
+const val TASK_STATE_FAILED = "FAILED"
+const val TASK_STATE_ABORTED = "ABORTED"
+
+/** 全部合法状态。 */
+val TASK_STATES: Set<String> = setOf(
+    TASK_STATE_PENDING_REVIEW, TASK_STATE_READY, TASK_STATE_RUNNING,
+    TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED
+)
+
+/** 终态集合：进入后不再受 revision 失效链影响，也不允许状态迁移。 */
+val TASK_TERMINAL_STATES: Set<String> = setOf(TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED)
+
+/** 合法状态迁移表（不含同态幂等，同态单独放行）。 */
+val TASK_STATE_TRANSITIONS: Map<String, Set<String>> = mapOf(
+    TASK_STATE_PENDING_REVIEW to setOf(TASK_STATE_READY, TASK_STATE_RUNNING),
+    TASK_STATE_READY to setOf(TASK_STATE_RUNNING, TASK_STATE_PENDING_REVIEW),
+    TASK_STATE_RUNNING to setOf(TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED),
+    TASK_STATE_SUCCESS to emptySet(),
+    TASK_STATE_FAILED to emptySet(),
+    TASK_STATE_ABORTED to emptySet()
+)
+
+/** 状态是否合法。 */
+fun isValidTaskState(state: String): Boolean = state in TASK_STATES
+
+/**
+ * 状态迁移是否合法。
+ * - 同态（from == to）恒合法：支持客户端断线重传的幂等 upsert
+ * - 终态不允许迁移到任何其它状态
+ * - 其余按 TASK_STATE_TRANSITIONS 校验
+ */
+fun isValidTaskTransition(from: String, to: String): Boolean {
+    if (from == to) return true
+    if (from in TASK_TERMINAL_STATES) return false
+    return TASK_STATE_TRANSITIONS[from]?.contains(to) == true
+}
+
+/** 中文状态标签（管理后台/导出用）。 */
+fun taskStateLabel(state: String): String = when (state) {
+    TASK_STATE_PENDING_REVIEW -> "待审"
+    TASK_STATE_READY -> "就绪"
+    TASK_STATE_RUNNING -> "执行中"
+    TASK_STATE_SUCCESS -> "完成"
+    TASK_STATE_FAILED -> "失败"
+    TASK_STATE_ABORTED -> "中止"
+    else -> state
+}
+
 @Serializable
 data class TaskRecord(
     val id: String = "",
     val partName: String = "",
     val planId: String = "",
+    /** 兼容字段：旧版客户端/历史记录仅写 status，服务端读取时回填到 state。 */
     val status: String = "SUCCESS",
+    /** 生命周期状态（P2-③）。新客户端必填，旧客户端缺省时取 status。 */
+    val state: String = "SUCCESS",
     val durationSec: Double = 0.0,
     val operator: String = "",
     val startedAt: Long = 0L,
     val finishedAt: Long = 0L
-)
+) {
+    /** 实际生效状态：state 非空用 state，否则回退 status（兼容旧客户端）。 */
+    val effectiveState: String get() = state.takeIf { it.isNotBlank() } ?: status
+}
 
 /** 客户端上报的实时状态（服务端转发给管理后台 WebSocket）。 */
 @Serializable

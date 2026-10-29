@@ -235,6 +235,10 @@ interface TaskHistoryDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(entity: TaskHistoryEntity)
 
+    /** 仅更新状态（P2-③ 状态机迁移，如 RUNNING → SUCCESS）。 */
+    @Query("UPDATE task_history SET state = :state, status = :state WHERE id = :id")
+    suspend fun updateState(id: String, state: String)
+
     @Query("SELECT COUNT(*) FROM task_history")
     suspend fun count(): Int
 

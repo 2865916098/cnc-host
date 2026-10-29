@@ -67,6 +67,10 @@ object SimpleRunController {
     private var stopPhase: RunPhase? = null
 
     /** 开始执行刀路；同一时间只允许一个作业。 */
+    /** 当前作业的本地任务记录 id（P2-③：加工启动时即创建，结束时状态迁移）。 */
+    @Volatile
+    private var currentTaskId: String? = null
+
     fun start(context: Context, taskName: String, drawingId: String, toolpath: Toolpath) {
         if (_state.value.running) return
         job?.cancel()
@@ -74,8 +78,28 @@ object SimpleRunController {
         val app = context.applicationContext
         val startedAt = System.currentTimeMillis()
         val segments = toolpath.segments
+        val taskId = "task-${System.currentTimeMillis()}"
 
         LogRecorder.info(context, "TASK", "加工启动：$taskName，${segments.size} 段刀路", taskId = drawingId)
+
+        // P2-③：加工启动即写入 RUNNING 状态记录，让历史页立即可见
+        currentTaskId = taskId
+        scope.launch {
+            runCatching {
+                val entity = TaskHistoryEntity(
+                    id = taskId,
+                    partName = taskName.ifBlank { "未命名任务" },
+                    planId = drawingId,
+                    status = "RUNNING",
+                    state = "RUNNING",
+                    durationSec = 0.0,
+                    operator = "平板操作员",
+                    startedAt = startedAt,
+                    finishedAt = 0L
+                )
+                CncDatabase.getInstance(app).taskHistoryDao().insert(entity)
+            }
+        }
 
         _state.value = SimpleRunState(
             taskName = taskName,
@@ -231,16 +255,18 @@ object SimpleRunController {
         )) }
 
         if (previous.startedAt > 0L) {
-            val status = when (phase) {
+            val finalState = when (phase) {
                 RunPhase.COMPLETED -> "SUCCESS"
                 RunPhase.FAILED -> "FAILED"
                 else -> "ABORTED"
             }
+            val taskId = currentTaskId ?: "task-${System.currentTimeMillis()}"
             val entity = TaskHistoryEntity(
-                id = "task-${System.currentTimeMillis()}",
+                id = taskId,
                 partName = previous.taskName.ifBlank { "未命名任务" },
                 planId = previous.drawingId,
-                status = status,
+                status = finalState,
+                state = finalState,
                 durationSec = (finishedAt - previous.startedAt) / 1000.0,
                 operator = "平板操作员",
                 startedAt = previous.startedAt,
@@ -250,6 +276,7 @@ object SimpleRunController {
                 CncDatabase.getInstance(app).taskHistoryDao().insert(entity)
                 SyncManager.uploadTask(app, entity, entity.operator)
             }
+            currentTaskId = null
         }
         reportStatus(app, _state.value)
     }

@@ -141,6 +141,8 @@ data class TaskDto(
     val partName: String = "",
     val planId: String = "",
     val status: String = "SUCCESS",
+    /** 生命周期状态（P2-③）：PENDING_REVIEW / READY / RUNNING / SUCCESS / FAILED / ABORTED */
+    val state: String = "SUCCESS",
     val durationSec: Double = 0.0,
     val operator: String = "",
     val startedAt: Long = 0L,
