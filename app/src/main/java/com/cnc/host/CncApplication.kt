@@ -34,7 +34,7 @@ class CncApplication : Application() {
         val db = cncDb()
         ensureSeeded(db)
 
-        // 保活 + 心跳（注册后才会真正上报）。
+        // 保活 + 心跳（激活后才会真正上报）。
         // 保活服务只在前台启动，避免后台进程起前台服务被系统判定超时崩溃
         KioskService.startIfForeground(this)
         DeviceHeartbeat.start(this)

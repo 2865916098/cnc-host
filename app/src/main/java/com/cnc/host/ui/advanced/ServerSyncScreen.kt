@@ -15,12 +15,11 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -75,7 +74,7 @@ fun ServerSyncScreen(
 
         // ===== 连接设置 =====
         Section("连接设置") {
-            OutlinedTextField(
+            KioskTextField(
                 value = ui.baseUrl,
                 onValueChange = viewModel::setBaseUrl,
                 label = { Text("服务端地址") },
@@ -84,28 +83,29 @@ fun ServerSyncScreen(
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(8.dp))
-            OutlinedTextField(
+            KioskTextField(
                 value = ui.token,
                 onValueChange = viewModel::setToken,
-                label = { Text("管理口令（CNC_ADMIN_TOKEN）") },
+                label = { Text("设备令牌/管理口令（激活后自动填充）") },
                 singleLine = true,
                 modifier = Modifier.fillMaxWidth()
             )
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                OutlinedTextField(
+                KioskTextField(
                     value = ui.deviceId,
                     onValueChange = viewModel::setDeviceId,
                     label = { Text("设备编号") },
                     singleLine = true,
                     modifier = Modifier.weight(1f)
                 )
-                OutlinedTextField(
+                KioskTextField(
                     value = ui.pin,
                     onValueChange = viewModel::setPin,
                     label = { Text("高级 PIN") },
                     singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    keyboardType = KeyboardType.NumberPassword,
+                    isPassword = true,
                     modifier = Modifier.weight(1f)
                 )
             }

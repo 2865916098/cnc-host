@@ -11,12 +11,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -27,8 +26,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cnc.ui.theme.CncColors
@@ -68,13 +65,12 @@ fun KioskSettingsOverlay(
                             color = CncColors.TextSecondary
                         )
                         Spacer(Modifier.height(12.dp))
-                        OutlinedTextField(
+                        KioskTextField(
                             value = ui.password,
                             onValueChange = viewModel::setPassword,
                             label = { Text("管理员密码") },
                             singleLine = true,
-                            visualTransformation = PasswordVisualTransformation(),
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                            isPassword = true,
                             modifier = Modifier.fillMaxWidth()
                         )
                         if (ui.passwordError != null) {
@@ -106,7 +102,7 @@ fun KioskSettingsOverlay(
 
                 Text("服务器地址（只填 IP，http:// 与端口自动补全）", style = CncTypography.bodyLarge, color = CncColors.TextPrimary)
                 Spacer(Modifier.height(6.dp))
-                OutlinedTextField(
+                KioskTextField(
                     value = ui.serverAddress,
                     onValueChange = viewModel::setServerAddress,
                     placeholder = { Text("例如 192.168.28.18") },
@@ -128,10 +124,10 @@ fun KioskSettingsOverlay(
                 OutlinedButton(
                     onClick = { showResetConfirm = true },
                     modifier = Modifier.fillMaxWidth().height(52.dp)
-                ) { Text("清除数据重新注册", style = CncTypography.titleMedium, color = CncColors.Warning) }
+                ) { Text("清除数据重新激活", style = CncTypography.titleMedium, color = CncColors.Warning) }
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    "清除本机注册信息并重启进入注册流程。若后台仍保留该设备记录，重新注册会被拒绝，需管理员在后台先「注销」。",
+                    "清除本机激活信息并重启进入激活流程。后台仍保留该设备记录，重新激活后会沿用原有登记信息。",
                     style = CncTypography.labelSmall,
                     color = CncColors.TextSecondary
                 )
@@ -159,10 +155,10 @@ fun KioskSettingsOverlay(
         AlertDialog(
             onDismissRequest = { showResetConfirm = false },
             containerColor = CncColors.Surface,
-            title = { Text("清除数据重新注册？", color = CncColors.TextPrimary) },
+            title = { Text("清除数据重新激活？", color = CncColors.TextPrimary) },
             text = {
                 Text(
-                    "将清除本机的注册信息并自动重启软件，回到配网与注册流程。若后台仍有该设备记录，重新注册时会提示「设备已注册」，需管理员在后台注销后才能成功。",
+                    "将清除本机的激活信息并自动重启软件，回到配网与激活流程。重新激活时后台会沿用该设备的原有登记信息。",
                     color = CncColors.TextSecondary
                 )
             },

@@ -5,13 +5,12 @@ import com.cnc.device.api.CommandStatus
 import com.cnc.device.api.DeviceCommand
 import com.cnc.device.api.DeviceController
 import com.cnc.host.data.DeviceRepository
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.persistence.CncDatabase
 import com.cnc.host.persistence.TaskHistoryEntity
 import com.cnc.host.sync.StatusDto
 import com.cnc.host.sync.SyncManager
-import com.cnc.model.cam.MotionType
 import com.cnc.model.cam.Toolpath
-import com.cnc.model.drawing.Point2D
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -68,6 +67,10 @@ object SimpleRunController {
     private var stopPhase: RunPhase? = null
 
     /** 开始执行刀路；同一时间只允许一个作业。 */
+    /** 当前作业的本地任务记录 id（P2-③：加工启动时即创建，结束时状态迁移）。 */
+    @Volatile
+    private var currentTaskId: String? = null
+
     fun start(context: Context, taskName: String, drawingId: String, toolpath: Toolpath) {
         if (_state.value.running) return
         job?.cancel()
@@ -75,6 +78,28 @@ object SimpleRunController {
         val app = context.applicationContext
         val startedAt = System.currentTimeMillis()
         val segments = toolpath.segments
+        val taskId = "task-${System.currentTimeMillis()}"
+
+        LogRecorder.info(context, "TASK", "加工启动：$taskName，${segments.size} 段刀路", taskId = drawingId)
+
+        // P2-③：加工启动即写入 RUNNING 状态记录，让历史页立即可见
+        currentTaskId = taskId
+        scope.launch {
+            runCatching {
+                val entity = TaskHistoryEntity(
+                    id = taskId,
+                    partName = taskName.ifBlank { "未命名任务" },
+                    planId = drawingId,
+                    status = "RUNNING",
+                    state = "RUNNING",
+                    durationSec = 0.0,
+                    operator = "平板操作员",
+                    startedAt = startedAt,
+                    finishedAt = 0L
+                )
+                CncDatabase.getInstance(app).taskHistoryDao().insert(entity)
+            }
+        }
 
         _state.value = SimpleRunState(
             taskName = taskName,
@@ -115,16 +140,9 @@ object SimpleRunController {
 
                 for ((idx, seg) in segments.withIndex()) {
                     if (!isActive) break
-                    val target = Point2D(seg.end.x, seg.end.y)
                     val cmdId = "simple-${drawingId}-${idx}-${System.currentTimeMillis()}"
-                    val cmd = when (seg.motionType) {
-                        MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, drawingId, target)
-                        MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
-                            cmdId, drawingId, target,
-                            seg.feedMmPerMin.takeIf { it > 0.0 } ?: 100.0
-                        )
-                        MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, drawingId, target, 100.0)
-                    }
+                    // R1 修复：圆弧段按 ARC_FEED 下发；缺圆心时 fromSegment 抛错，拒绝按弦加工
+                    val cmd = DeviceCommand.fromSegment(cmdId, drawingId, seg)
 
                     val result = device.sendMotionCommand(cmd)
                     val status = if (result.isSuccess) {
@@ -220,6 +238,15 @@ object SimpleRunController {
             error = if (phase == RunPhase.FAILED) finalMessage else previous.error
         )
 
+        // 记录加工结果日志
+        when (phase) {
+            RunPhase.COMPLETED -> LogRecorder.info(app, "TASK", "加工完成：${previous.taskName}", taskId = previous.drawingId)
+            RunPhase.FAILED -> LogRecorder.error(app, "TASK", "加工失败：${finalMessage}", taskId = previous.drawingId)
+            RunPhase.ESTOPPED -> LogRecorder.error(app, "ALARM", "急停触发，加工中止：${previous.taskName}", taskId = previous.drawingId)
+            RunPhase.STOPPED -> LogRecorder.warn(app, "TASK", "受控停止：${previous.taskName}", taskId = previous.drawingId)
+            else -> {}
+        }
+
         // 停止主轴（失败仅记录日志，不覆盖作业结果）
         runCatching { device.sendMotionCommand(DeviceCommand.setSpindle(
             commandId = "simple-spindle-off-${System.currentTimeMillis()}",
@@ -228,16 +255,18 @@ object SimpleRunController {
         )) }
 
         if (previous.startedAt > 0L) {
-            val status = when (phase) {
+            val finalState = when (phase) {
                 RunPhase.COMPLETED -> "SUCCESS"
                 RunPhase.FAILED -> "FAILED"
                 else -> "ABORTED"
             }
+            val taskId = currentTaskId ?: "task-${System.currentTimeMillis()}"
             val entity = TaskHistoryEntity(
-                id = "task-${System.currentTimeMillis()}",
+                id = taskId,
                 partName = previous.taskName.ifBlank { "未命名任务" },
                 planId = previous.drawingId,
-                status = status,
+                status = finalState,
+                state = finalState,
                 durationSec = (finishedAt - previous.startedAt) / 1000.0,
                 operator = "平板操作员",
                 startedAt = previous.startedAt,
@@ -247,6 +276,7 @@ object SimpleRunController {
                 CncDatabase.getInstance(app).taskHistoryDao().insert(entity)
                 SyncManager.uploadTask(app, entity, entity.operator)
             }
+            currentTaskId = null
         }
         reportStatus(app, _state.value)
     }

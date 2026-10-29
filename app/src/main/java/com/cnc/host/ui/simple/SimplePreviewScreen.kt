@@ -134,6 +134,22 @@ fun SimplePreviewScreen(
                     }
                 }
 
+                // 验证器未执行的校验项（规范 §3.3：未实现必须明示，不得宣称通过）
+                if (ui.unverifiedChecks.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Column(
+                        Modifier
+                            .fillMaxWidth()
+                            .background(Color(0x1A60A5FA), RoundedCornerShape(6.dp))
+                            .padding(12.dp)
+                    ) {
+                        Text("以下校验尚未执行，请人工确认", style = CncTypography.titleMedium, color = CncColors.TextSecondary)
+                        ui.unverifiedChecks.forEach {
+                            Text("• 未校验：$it", style = CncTypography.bodyMedium, color = CncColors.TextSecondary)
+                        }
+                    }
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 // ===== G-code =====

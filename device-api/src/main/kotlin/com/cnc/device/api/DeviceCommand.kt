@@ -1,6 +1,7 @@
 package com.cnc.device.api
 
 import com.cnc.model.cam.MotionType
+import com.cnc.model.cam.ToolpathSegment
 import com.cnc.model.drawing.Point2D
 
 /** 命令类型。 */
@@ -69,6 +70,61 @@ data class DeviceCommand(
             type = CommandType.LINEAR_FEED,
             params = mapOf("x" to target.x, "z" to target.y, "feed" to feedMmPerMin)
         )
+
+        /**
+         * 构造圆弧进给命令（G02/G03 语义：终点 + 圆心 + 半径 + 方向）。
+         *
+         * 圆心为工件坐标系绝对坐标；执行端如需 I/K 增量自行换算。
+         */
+        fun arcFeed(
+            commandId: String,
+            taskId: String?,
+            target: Point2D,
+            center: Point2D,
+            radius: Double,
+            clockwise: Boolean,
+            feedMmPerMin: Double
+        ): DeviceCommand = DeviceCommand(
+            commandId = commandId,
+            taskId = taskId,
+            type = CommandType.ARC_FEED,
+            params = mapOf(
+                "x" to target.x,
+                "z" to target.y,
+                "cx" to center.x,
+                "cz" to center.y,
+                "radius" to radius,
+                "clockwise" to clockwise,
+                "feed" to feedMmPerMin
+            )
+        )
+
+        /**
+         * 由刀路段构造运动命令（R1 修复：圆弧段下发 ARC_FEED，不再降级为弦）。
+         *
+         * 圆弧段必须携带圆心数据；缺失时抛出异常拒绝下发——
+         * 按弦加工会改变工件几何形状，存在过切风险，宁可停止也不盲发。
+         */
+        fun fromSegment(commandId: String, taskId: String?, seg: ToolpathSegment): DeviceCommand {
+            val target = Point2D(seg.end.x, seg.end.y)
+            val feed = seg.feedMmPerMin.takeIf { it > 0.0 } ?: 100.0
+            return when (seg.motionType) {
+                MotionType.RAPID -> rapidMove(commandId, taskId, target)
+                MotionType.LINEAR_FEED -> linearFeed(commandId, taskId, target, feed)
+                MotionType.ARC_FEED -> {
+                    val center = requireNotNull(seg.center) {
+                        "圆弧段[${seg.segmentId}]缺少圆心数据，拒绝下发（禁止按弦加工）"
+                    }
+                    arcFeed(
+                        commandId, taskId, target,
+                        center = Point2D(center.x, center.y),
+                        radius = seg.radius ?: 0.0,
+                        clockwise = seg.clockwise ?: true,
+                        feedMmPerMin = feed
+                    )
+                }
+            }
+        }
 
         /**
          * 主轴命令。

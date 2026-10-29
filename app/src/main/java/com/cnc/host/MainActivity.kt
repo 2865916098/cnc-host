@@ -37,6 +37,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.navigation.Screen
 import com.cnc.host.navigation.advancedNavItems
 import com.cnc.host.navigation.simpleNavItems
@@ -69,7 +70,9 @@ import com.cnc.host.ui.review.ReviewScreen
 import com.cnc.host.ui.settings.SettingsScreen
 import com.cnc.host.ui.setup.KioskSettingsOverlay
 import com.cnc.host.ui.setup.NetworkSetupScreen
-import com.cnc.host.ui.setup.RegisterScreen
+import com.cnc.host.ui.setup.PermissionsSetupScreen
+import com.cnc.host.ui.setup.SplashScreen
+import com.cnc.host.ui.setup.ActivationScreen
 import com.cnc.host.ui.simple.SimpleAlarmsScreen
 import com.cnc.host.ui.simple.SimpleMonitorScreen
 import com.cnc.host.ui.simple.SimplePreviewScreen
@@ -117,11 +120,30 @@ class MainActivity : ComponentActivity() {
             }
         })
         enableEdgeToEdge()
+        // 客户端统一使用内嵌键盘，禁止系统输入法弹出
+        window.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN)
+        // Kiosk 工业平板：加工期间屏幕常亮，避免操作工看不到机床状态（设备接电常驻场景）
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        hideSystemBars()
         setContent {
             CncTheme {
                 CncHostApp()
             }
         }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        // 下拉通知栏/上滑手势会短暂唤出系统栏，重新获得焦点时立刻再隐藏
+        if (hasFocus) hideSystemBars()
+    }
+
+    /** Kiosk 沉浸式：隐藏状态栏与导航栏，页面不被系统 UI 遮挡，也减少误触退出的入口。 */
+    private fun hideSystemBars() {
+        val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        controller.systemBarsBehavior =
+            androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
     }
 
     override fun onUserLeaveHint() {
@@ -146,8 +168,8 @@ class MainActivity : ComponentActivity() {
 /**
  * 主界面。
  *
- * 首次启动（未注册）时先引导「网络配置 → 设备注册」；
- * 注册完成后进入主界面。主界面默认是傻瓜式简易模式：底部 4 个页签
+ * 首次启动（未激活）时先引导「网络配置 → 权限引导 → 设备激活」；
+ * 激活完成后进入主界面。主界面默认是傻瓜式简易模式：底部 4 个页签
  * （任务 / 预览下发 / 运行监控 / 报警状态）。高级配置通过顶部「高级模式」+ PIN 进入，
  * 使用左侧导航栏。顶部右侧「设置」按钮需管理员密码，可修改服务器地址或临时退出到安卓桌面。
  *
@@ -162,13 +184,25 @@ fun CncHostApp() {
         mutableStateOf(SetupPrefs.load(context).setupCompleted)
     }
 
-    // 首次启动引导流程：0=网络配置，1=设备注册
+    // 首次启动引导流程：Splash → 0=网络配置 → 1=设备激活 → 2=权限配置 → 主界面
+    var showSplash by rememberSaveable { mutableStateOf(!setupCompleted) }
     var setupStep by rememberSaveable { mutableIntStateOf(0) }
 
     if (!setupCompleted) {
+        if (showSplash) {
+            // 科技感启动页：2 秒自动或点击「开始激活」进入引导
+            SplashScreen(onEnter = { showSplash = false })
+            return
+        }
         when (setupStep) {
             0 -> NetworkSetupScreen(onNext = { setupStep = 1 })
-            else -> RegisterScreen(onRegistered = {
+            1 -> ActivationScreen(
+                // 激活成功动画播完后进入权限配置页
+                onActivated = { setupStep = 2 },
+                // 激活时检测到未联网：回到第 0 步重新配置网络
+                onGoToNetwork = { setupStep = 0 }
+            )
+            else -> PermissionsSetupScreen(onNext = {
                 setupCompleted = true
                 PermissionsHolder.load(context)
             })
@@ -177,7 +211,10 @@ fun CncHostApp() {
     }
 
     // 进入主应用后加载一次缓存的权限（心跳会持续更新）
-    LaunchedEffect(Unit) { PermissionsHolder.load(context) }
+    LaunchedEffect(Unit) {
+        PermissionsHolder.load(context)
+        LogRecorder.info(context, "SYSTEM", "应用启动，进入主界面")
+    }
 
     val perms by PermissionsHolder.flow.collectAsState()
     val navController = rememberNavController()

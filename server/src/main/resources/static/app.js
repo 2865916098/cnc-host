@@ -8,11 +8,16 @@
     config: null,
     tasks: [],
     devices: [],
+    orgSummary: [],
     appVersion: null,
+    apkCandidate: null,
     status: null,
     tab: "overview",
     ws: null,
-    devicesTimer: null
+    devicesTimer: null,
+    user: null,
+    users: [],
+    usersLoaded: false
   };
 
   const $ = (id) => document.getElementById(id);
@@ -67,6 +72,17 @@
       S.username = data.username || username;
       localStorage.setItem("cnc_token", S.token);
       localStorage.setItem("cnc_user", S.username);
+      // 旧后端不返回角色/权限字段时保持 null，交给 loadMe 统一降级
+      S.user = data.role ? {
+        id: null,
+        username: S.username,
+        displayName: data.displayName || S.username,
+        role: data.role,
+        permissions: Array.isArray(data.permissions) ? data.permissions : [],
+        superAdmin: data.role === "SUPER_ADMIN"
+      } : null;
+      await loadMe();
+      if (!S.token) return;
       enterApp();
       await loadAll();
       connectWs();
@@ -75,8 +91,32 @@
     }
   }
 
+  // 当前登录用户：/users/me 未就绪时降级，避免登录流程中断
+  async function loadMe() {
+    try {
+      const me = await api("/api/v1/users/me");
+      S.user = {
+        id: me.id,
+        username: me.username || S.username,
+        displayName: me.displayName || me.username || S.username,
+        role: me.role || "",
+        permissions: Array.isArray(me.permissions) ? me.permissions : [],
+        superAdmin: !!(me.superAdmin || me.role === "SUPER_ADMIN")
+      };
+    } catch (e) {
+      if (!S.token) return; // 401 已被 logout 处理
+      if (!S.user) {
+        S.user = { superAdmin: true, role: "SUPER_ADMIN", permissions: [], username: S.username, displayName: S.username };
+      }
+    }
+    renderNav();
+  }
+
   function enterApp() {
-    $("current-user").textContent = S.username || "-";
+    const u = S.user || {};
+    const name = u.displayName || u.username || S.username || "-";
+    const role = u.role ? "（" + (ROLE_LABELS[u.role] || u.role) + "）" : "";
+    $("current-user").textContent = name + role;
     $("login").style.display = "none";
     $("app").style.display = "block";
   }
@@ -90,6 +130,10 @@
     localStorage.removeItem("cnc_user");
     S.token = "";
     S.username = "";
+    S.user = null;
+    S.users = [];
+    S.usersLoaded = false;
+    S.tab = "overview";
     if (S.ws) { try { S.ws.close(); } catch (_) {} S.ws = null; }
     $("app").style.display = "none";
     $("login").style.display = "flex";
@@ -100,9 +144,12 @@
   // ===== 数据 =====
   async function loadAll() {
     S.config = await api("/api/v1/config");
-    S.tasks = await api("/api/v1/tasks");
+    // R6：无「任务记录」模块权限的账号会拿到 403，容错为空列表避免登录后白屏
+    S.tasks = await api("/api/v1/tasks").catch(() => []);
     S.devices = await api("/api/v1/devices").catch(() => []);
+    S.orgSummary = await api("/api/v1/devices/org-summary").catch(() => []);
     S.appVersion = await api("/api/v1/app-version-info").catch(() => null);
+    S.apkCandidate = await api("/api/v1/app-latest-candidate").catch(() => null);
     $("cfg-version").textContent = S.config.version;
     renderNav();
     render();
@@ -122,6 +169,30 @@
     }).join("");
   }
 
+  // ===== 权限 =====
+  const ROLE_LABELS = { SUPER_ADMIN: "超级管理员", ADMIN: "管理员", PROCESS_ENGINEER: "工艺员", OPERATOR: "操作员", QUALITY: "质检员" };
+  const MODULE_LABELS = {
+    overview: "概览", device: "设备与通讯", tools: "刀具库", materials: "材料库",
+    parts: "零件与毛坯", plans: "工艺方案", drawings: "图纸任务", devices: "设备管理",
+    tasks: "任务记录", users: "用户管理", app: "客户端发布", logs: "操作日志"
+  };
+  // 角色默认模块权限（ADR-0003），新建/切换角色时自动勾选，仍可手工调整
+  const ROLE_DEFAULT_PERMS = {
+    SUPER_ADMIN: [],
+    ADMIN: Object.keys(MODULE_LABELS),
+    PROCESS_ENGINEER: ["overview", "tools", "materials", "parts", "plans", "drawings"],
+    OPERATOR: ["overview", "device", "tasks"],
+    QUALITY: ["overview", "tasks", "logs"]
+  };
+  const USER_MODULES = Object.keys(MODULE_LABELS);
+
+  function can(perm) {
+    const u = S.user;
+    if (!u) return true; // 未知时宽松，避免空白后台
+    if (u.superAdmin || u.role === "SUPER_ADMIN") return true;
+    return (u.permissions || []).includes(perm);
+  }
+
   // ===== 导航 =====
   const TABS = [
     { id: "overview", label: "概览", sub: "配置版本与设备实时状态" },
@@ -131,34 +202,57 @@
     { id: "parts", label: "零件与毛坯", sub: "零件、毛坯尺寸与装夹方式", count: (c) => c.parts.length + c.blanks.length },
     { id: "plans", label: "工艺方案", sub: "工序步骤与切削参数", count: (c) => c.plans.length },
     { id: "drawings", label: "图纸任务", sub: "DXF 原文与尺寸校正，客户端据此生成刀路", count: (c) => c.drawings.length },
-    { id: "devices", label: "设备管理", sub: "注册设备、在线状态与功能权限", count: () => S.devices.length },
-    { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length }
+    { id: "devices", label: "设备管理", sub: "已激活终端、在线状态与功能权限", count: () => S.devices.length },
+    { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length },
+    { id: "logs", label: "操作日志", sub: "设备上报的运行/报警日志", count: () => (S.logs || []).length },
+    { id: "users", label: "用户管理", sub: "后台账号、角色与模块权限分配", count: () => S.users ? S.users.length : "" }
   ];
 
+  function visibleTabs() {
+    return TABS.filter((t) => t.id === "overview" || can(t.id));
+  }
+
   function renderNav() {
-    $("nav").innerHTML = TABS.map((t) => {
-      const n = t.count ? t.count(S.config) : "";
+    const tabs = visibleTabs();
+    if (!tabs.some((t) => t.id === S.tab)) S.tab = "overview";
+    $("nav").innerHTML = tabs.map((t) => {
+      const n = t.count && S.config ? t.count(S.config) : "";
       return `<div class="nav-item ${S.tab === t.id ? "active" : ""}" onclick="switchTab('${t.id}')">
         <span>${esc(t.label)}</span><span class="count">${n}</span></div>`;
     }).join("");
   }
 
   window.switchTab = function (id) {
+    if (id !== "overview" && !can(id)) { toast("没有该模块的访问权限", true); return; }
     S.tab = id;
     renderNav();
     render();
     if (id === "devices") startDevicesPolling(); else stopDevicesPolling();
+    if (id === "users") loadUsers();
+    if (id === "logs") loadLogs();
   };
 
-  // ===== 设备页自动刷新：注册/心跳变化 3 秒内可见 =====
+  // ===== 设备页自动刷新：激活/心跳与单位统计变化 3 秒内可见 =====
   function startDevicesPolling() {
     stopDevicesPolling();
     S.devicesTimer = setInterval(async () => {
       if (S.tab !== "devices") { stopDevicesPolling(); return; }
       try {
-        const next = await api("/api/v1/devices");
+        // 只拉设备与单位统计，避免每 3 秒全量拉取配置
+        const [next, org] = await Promise.all([
+          api("/api/v1/devices"),
+          api("/api/v1/devices/org-summary").catch(() => null)
+        ]);
+        let changed = false;
         if (JSON.stringify(next) !== JSON.stringify(S.devices)) {
           S.devices = next;
+          changed = true;
+        }
+        if (Array.isArray(org) && JSON.stringify(org) !== JSON.stringify(S.orgSummary)) {
+          S.orgSummary = org;
+          changed = true;
+        }
+        if (changed) {
           renderNav();
           render();
         }
@@ -171,6 +265,7 @@
   }
 
   function render() {
+    if (!visibleTabs().some((t) => t.id === S.tab)) S.tab = "overview";
     const t = TABS.find((x) => x.id === S.tab);
     $("page-title").textContent = t.label;
     $("page-sub").textContent = t.sub;
@@ -184,9 +279,12 @@
       plans: viewPlans,
       drawings: viewDrawings,
       devices: viewDevices,
-      tasks: viewTasks
+      tasks: viewTasks,
+      logs: viewLogs,
+      users: viewUsers
     };
-    $("content").innerHTML = views[S.tab](c);
+    const view = views[S.tab] || viewOverview;
+    $("content").innerHTML = view(c);
   }
 
   // ===== 概览 =====
@@ -245,8 +343,10 @@
         </div>
       </div>
       <div class="panel">
-        <h3>通讯参数</h3>
+        <h3>驱动与通讯参数</h3>
         <div class="form-row">
+          <div class="field"><label>驱动类型</label><select id="comm_driver">${optionList(
+            [{v:"SIMULATOR",t:"SIMULATOR（内置模拟器）"},{v:"MODBUS_TCP",t:"MODBUS_TCP（通用网口控制卡）"}].map((x) => ({ v: x.v, t: x.t })), "v", (x) => x.t, comm.driverType || "SIMULATOR")}</select></div>
           <div class="field"><label>协议</label><select id="comm_proto">${optionList(
             ["MODBUS_TCP", "MODBUS_RTU", "SERIAL_TCP"].map((v) => ({ v })), "v", (x) => x.v.replace(/_/g, " "), comm.protocol)}</select></div>
           <div class="field"><label>设备站号</label><input id="comm_dev" type="number" value="${esc(comm.deviceId)}"></div>
@@ -261,11 +361,29 @@
           <div class="field"><label>波特率</label><select id="comm_baud">${optionList(
             [9600, 19200, 38400, 57600, 115200].map((v) => ({ v })), "v", (x) => String(x.v), comm.baudRate)}</select></div>
         </div>
+        <div class="form-row" style="margin-top:12px">
+          <div class="field"><label>驱动扩展参数（JSON，寄存器映射等；留空用默认布局）</label>
+            <textarea id="comm_params" rows="4" placeholder='{"pos_scale":"100","status_word_addr":"6"}' style="width:100%">${esc(JSON.stringify(comm.params || {}))}</textarea>
+            <div class="hint">换控制卡只需调整此处映射，客户端无需升级；非法 JSON 保存时会被拒绝。</div>
+          </div>
+        </div>
       </div>`;
   }
 
   window.saveDevice = async function () {
     const c = S.config;
+    let params = {};
+    const rawParams = ($("comm_params").value || "").trim();
+    if (rawParams) {
+      try {
+        const parsed = JSON.parse(rawParams);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是 JSON 对象");
+        for (const k of Object.keys(parsed)) params[k] = String(parsed[k]);
+      } catch (e) {
+        toast("驱动扩展参数 JSON 非法：" + e.message, true);
+        return;
+      }
+    }
     const d = {
       name: $("dev_name").value.trim(),
       controlCard: $("dev_card").value,
@@ -281,7 +399,9 @@
         serialPort: $("comm_serial").value.trim(),
         baudRate: Number($("comm_baud").value),
         deviceId: Number($("comm_dev").value),
-        timeoutMs: Number($("comm_timeout").value)
+        timeoutMs: Number($("comm_timeout").value),
+        driverType: $("comm_driver").value,
+        params: params
       }
     };
     try {
@@ -673,10 +793,71 @@
   }
 
   function viewTasks() {
-    return `<div class="panel"><h3>任务记录</h3>
+    return `<div class="panel"><h3>任务记录 <button class="small" onclick="exportCsv('tasks')">导出 CSV</button> <button class="small danger" onclick="cleanByRange('tasks')">按时间清理</button></h3>
       <div class="desc">由平板端在任务结束后自动上传；离线期间暂存本机，联网后补传。</div>
       ${taskTable(S.tasks)}</div>`;
   }
+
+  // ===== 操作日志 =====
+  async function loadLogs() {
+    try {
+      S.logs = await api("/api/v1/logs").catch(() => []);
+    } catch (e) { S.logs = []; }
+    if (S.tab === "logs") render();
+  }
+
+  function viewLogs() {
+    const list = S.logs || [];
+    const rows = list.map((l) => `<tr>
+      <td class="muted">${fmtTime(l.timestamp)}</td>
+      <td>${esc(l.deviceId || "-")}</td>
+      <td>${esc(l.level)}</td>
+      <td>${esc(l.category)}</td>
+      <td>${esc(l.message)}</td>
+    </tr>`).join("");
+    return `<div class="panel"><h3>操作日志 <button class="small" onclick="exportCsv('logs')">导出 CSV</button> <button class="small danger" onclick="cleanByRange('logs')">按时间清理</button></h3>
+      ${table(["时间", "设备", "级别", "分类", "消息"], rows, "暂无日志")}</div>`;
+  }
+
+  /** 导出 CSV：带鉴权拉取后以 Blob 方式触发浏览器下载。 */
+  window.exportCsv = async function (type) {
+    try {
+      const res = await fetch(`/api/v1/export/${type}`, { headers: { Authorization: "Bearer " + S.token } });
+      if (!res.ok) throw new Error(res.status);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${type}-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast("导出失败", true);
+    }
+  };
+
+  /** 按时间范围清理数据（任务/日志），需二次确认。 */
+  window.cleanByRange = async function (type) {
+    const label = type === "tasks" ? "任务记录" : "操作日志";
+    const fromStr = prompt(`清理「${label}」\n起始时间（留空表示不限制），格式：YYYY-MM-DD\n例如 2026-01-01`);
+    if (fromStr === null) return;
+    const toStr = prompt(`结束时间（留空表示不限制），格式：YYYY-MM-DD\n例如 2026-12-31`);
+    if (toStr === null) return;
+    const from = fromStr ? new Date(fromStr + "T00:00:00").getTime() : null;
+    const to = toStr ? new Date(toStr + "T23:59:59").getTime() : null;
+    if ((fromStr && isNaN(from)) || (toStr && isNaN(to))) { toast("日期格式无效", true); return; }
+    if (from == null && to == null) { toast("请至少填写一个时间边界", true); return; }
+    if (!confirm(`确认删除该时间范围内的全部${label}？此操作不可撤销。`)) return;
+    const qs = new URLSearchParams();
+    if (from != null) qs.set("from", from);
+    if (to != null) qs.set("to", to);
+    const r = await api(`/api/v1/data/${type}?${qs.toString()}`, { method: "DELETE" });
+    toast(r.message || "已清理");
+    if (type === "tasks") { S.tasks = await api("/api/v1/tasks").catch(() => S.tasks); render(); }
+    else { await loadLogs(); }
+  };
 
   // ===== 设备管理 =====
   const PERM_LABELS = [
@@ -703,14 +884,46 @@
     }).join("");
   }
 
+  /** 设备/单位地区展示：省份与城市拼接，缺失时显示灰色「未填写」 */
+  function regionText(province, city) {
+    const p = String(province || "").trim();
+    const c = String(city || "").trim();
+    if (!p && !c) return `<span class="muted">未填写</span>`;
+    return esc([p, c].filter(Boolean).join(" "));
+  }
+
+  /** 单位终端统计卡片：按单位汇总终端总数、在线数与最近活跃 */
+  function orgSummaryHtml() {
+    const list = (S.orgSummary || []).filter((g) => Number(g.deviceCount) >= 1);
+    if (!list.length) {
+      return `<div class="panel"><h3>单位终端统计</h3><div class="empty">暂无单位数据</div></div>`;
+    }
+    const rows = list.map((g) => {
+      const total = Number(g.deviceCount) || 0;
+      const online = Number(g.onlineCount) || 0;
+      const offline = Math.max(0, total - online);
+      return `<tr>
+        <td>${esc(g.orgName)}</td>
+        <td>${regionText(g.province, g.city)}</td>
+        <td>${total}</td>
+        <td><span class="org-badge on">在线 ${online}</span>${offline ? ` <span class="org-badge">离线 ${offline}</span>` : ""}</td>
+        <td class="muted">${fmtTime(g.lastSeen)}</td>
+      </tr>`;
+    }).join("");
+    return `<div class="panel"><h3>单位终端统计</h3>
+      <div class="org-summary${list.length > 8 ? " scroll" : ""}">
+        <table class="grid"><thead><tr><th>单位名称</th><th>地区</th><th>终端总数</th><th>在线</th><th>最近活跃</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div></div>`;
+  }
+
   function viewDevices() {
     const rows = S.devices.map((d) => `
       <tr>
-        <td><code>${esc(d.id)}</code></td>
-        <td>${esc(d.unitName)}</td>
-        <td>${esc(d.contactName)}</td>
-        <td>${esc(d.phone)}</td>
-        <td>${esc(d.serverAddress)}</td>
+        <td><code>${esc(d.id)}</code>${d.serverAddress ? `<div class="muted mono">${esc(d.serverAddress)}</div>` : ""}</td>
+        <td>${d.unitName ? esc(d.unitName) : `<span class="muted">未填写</span>`}</td>
+        <td>${regionText(d.province, d.city)}</td>
+        <td>${d.contactName ? esc(d.contactName) : `<span class="muted">未填写</span>`}${d.phone ? `<div class="muted mono">${esc(d.phone)}</div>` : ""}</td>
         <td>${esc(d.appVersion || "-")}</td>
         <td>${onlineBadge(d)}</td>
         <td>${fmtTime(d.lastSeen)}</td>
@@ -721,24 +934,36 @@
         </td>
       </tr>`).join("");
     const table = rows
-      ? `<table class="grid"><thead><tr><th>设备ID</th><th>单位</th><th>联系人</th><th>电话</th><th>服务器</th><th>版本</th><th>状态</th><th>最近心跳</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
-      : `<div class="desc">暂无注册设备。客户端首次启动完成注册后会出现在这里。同一台设备只能注册一次；如需重新注册，请先「注销」。</div>`;
+      ? `<table class="grid"><thead><tr><th>设备 / 服务器</th><th>单位</th><th>地区</th><th>联系人 / 电话</th><th>版本</th><th>状态</th><th>最近心跳</th><th>操作</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<div class="desc">暂无已激活终端。客户端首次启动完成激活后会出现在这里。同一台设备只能激活一次；如需重新激活，请先「注销」。</div>`;
     const ver = S.appVersion;
     const verText = ver && ver.versionCode > 0
       ? `当前已发布：<b>v${esc(ver.versionName)}</b>（versionCode ${ver.versionCode}，${Math.round((ver.sizeBytes || 0) / 1024)} KB，${fmtTime(ver.publishedAt)}）${ver.changelog ? "<br>更新说明：" + esc(ver.changelog) : ""}`
-      : "尚未发布客户端版本。上传 APK 后，在线设备会收到「发现新版本」提示，确认后自动下载安装。";
+      : "尚未发布客户端版本。发布后在线设备会收到「发现新版本」提示，确认后自动下载安装。";
+    const cand = S.apkCandidate;
+    const candHtml = cand && cand.found
+      ? `<div class="hint-box" style="margin-bottom:10px">
+           检测到最新构建：<b>v${esc(cand.versionName)}</b>（versionCode ${cand.versionCode}，${Math.round(cand.sizeBytes / 1024)} KB，${esc(cand.fileName)}，${fmtTime(cand.modifiedAt)}）
+           <button class="primary" style="margin-left:12px" onclick="publishLatestApk()">一键发布此版本</button>
+         </div>`
+      : `<div class="desc" style="margin-bottom:10px">未检测到构建产物。请先在电脑上执行 gradlew assembleRelease（或 assembleDebug），服务端会自动识别 app/build/outputs/apk 下的最新 APK。</div>`;
     return `
-      <div class="hint-box">客户端首次打开会先配置网络并注册（单位、姓名、电话、服务器地址）。注册后可在此查看在线状态（90 秒无心跳视为离线），并按设备开关功能权限。本页每 3 秒自动刷新。</div>
-      <div class="panel"><h3>已注册设备</h3>${table}</div>
+      <div class="hint-box">已激活终端列表。设备首次启动需激活并填写单位与地区，便于按单位统计终端数量。</div>
+      ${orgSummaryHtml()}
+      <div class="panel"><h3>已激活终端 <button class="small" onclick="exportCsv('devices')">导出 CSV</button></h3>${table}</div>
       <div class="panel"><h3>客户端版本发布（自动更新）</h3>
         <div class="desc" style="margin-bottom:10px">${verText}</div>
-        <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:10px">
-          <div><label class="form-label">APK 文件</label><input type="file" id="apk-file" accept=".apk"></div>
-          <div style="width:120px"><label class="form-label">versionCode</label><input type="number" id="apk-code" class="input" placeholder="如 ${ver && ver.versionCode ? ver.versionCode + 1 : 2}"></div>
-          <div style="width:160px"><label class="form-label">版本名</label><input type="text" id="apk-name" class="input" placeholder="如 1.1.0"></div>
-        </div>
+        ${candHtml}
         <div style="margin-top:8px"><label class="form-label">更新说明（可选）</label><input type="text" id="apk-changelog" class="input" placeholder="修复了…"></div>
-        <div class="row" style="margin-top:10px"><button class="primary" onclick="publishApk()">发布新版本</button></div>
+        <details style="margin-top:10px">
+          <summary class="desc" style="cursor:pointer">手动上传 APK（兜底，一般不用）</summary>
+          <div class="row" style="align-items:flex-end; flex-wrap:wrap; gap:10px; margin-top:8px">
+            <div><label class="form-label">APK 文件</label><input type="file" id="apk-file" accept=".apk"></div>
+            <div style="width:120px"><label class="form-label">versionCode</label><input type="number" id="apk-code" class="input" value="${cand && cand.found ? cand.versionCode : ""}" placeholder="如 ${ver && ver.versionCode ? ver.versionCode + 1 : 2}"></div>
+            <div style="width:160px"><label class="form-label">版本名</label><input type="text" id="apk-name" class="input" value="${cand && cand.found ? esc(cand.versionName) : ""}" placeholder="如 1.1.0"></div>
+            <div><button onclick="publishApk()">上传并发布</button></div>
+          </div>
+        </details>
         <div class="desc" style="margin-top:8px">注意：发新版时需把 app/build.gradle.kts 里的 versionCode 加 1 再构建，客户端按 versionCode 判断是否为新版本。</div>
       </div>
       <div class="panel"><h3>管理员账号密码
@@ -752,6 +977,10 @@
     openModal(`修改设备信息（${esc(d.id)}）`, `
       <label class="form-label">单位名称</label>
       <input type="text" id="edit-unit" class="input" value="${esc(d.unitName)}">
+      <div class="grid2" style="margin-top:10px">
+        <div class="field"><label>省份</label><input type="text" class="input" value="${esc(d.province)}" placeholder="未填写" readonly></div>
+        <div class="field"><label>城市</label><input type="text" class="input" value="${esc(d.city)}" placeholder="未填写" readonly></div>
+      </div>
       <label class="form-label" style="margin-top:10px">联系人</label>
       <input type="text" id="edit-contact" class="input" value="${esc(d.contactName)}">
       <label class="form-label" style="margin-top:10px">电话</label>
@@ -768,10 +997,20 @@
   };
 
   window.removeDevice = async function (id, unitName) {
-    if (!confirm(`确认注销设备 ${id}（${unitName}）？\n注销后该设备客户端会提示「设备已注册」无法使用，直到重新注册。`)) return;
+    if (!confirm(`确认注销设备 ${id}（${unitName}）？\n注销后该设备客户端将无法使用，需重新激活。`)) return;
     try {
       await api(`/api/v1/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
       toast("设备已注销");
+      await loadAll();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  /** 一键发布服务端扫描到的最新构建，无需手动选择 APK。 */
+  window.publishLatestApk = async function () {
+    const changelog = $("apk-changelog") ? $("apk-changelog").value.trim() : "";
+    try {
+      const data = await api("/api/v1/app-publish-latest", { method: "POST", body: { changelog } });
+      toast(data.message || "发布成功");
       await loadAll();
     } catch (e) { toast(e.message, true); }
   };
@@ -829,6 +1068,203 @@
     });
   };
 
+  // ===== 用户管理 =====
+  const USER_ROLES = [
+    { v: "SUPER_ADMIN", label: "超级管理员" },
+    { v: "ADMIN", label: "管理员" },
+    { v: "PROCESS_ENGINEER", label: "工艺员" },
+    { v: "OPERATOR", label: "操作员" },
+    { v: "QUALITY", label: "质检员" }
+  ];
+
+  function applyRoleDefaultPerms(role) {
+    const set = new Set(ROLE_DEFAULT_PERMS[role] || []);
+    $("modal-body").querySelectorAll("input[data-mperm]").forEach((el) => {
+      el.checked = set.has(el.dataset.mperm);
+    });
+  }
+
+  function findUser(id) {
+    return (S.users || []).find((u) => String(u.id) === String(id));
+  }
+
+  function isSelfUser(u) {
+    const me = S.user || {};
+    if (!u) return false;
+    if (me.id != null && u.id != null) return String(me.id) === String(u.id);
+    return !!me.username && u.username === me.username;
+  }
+
+  function roleLabel(role) { return ROLE_LABELS[role] || role || "-"; }
+
+  function userPermTags(u) {
+    if (u.superAdmin || u.role === "SUPER_ADMIN") return `<span class="tag on">全部权限</span>`;
+    const perms = u.permissions || [];
+    if (!perms.length) return `<span class="muted">无</span>`;
+    return `<div class="perm-tags">${perms.map((k) => `<span class="tag">${esc(MODULE_LABELS[k] || k)}</span>`).join("")}</div>`;
+  }
+
+  function viewUsers() {
+    const rows = (S.users || []).map((u) => {
+      const self = isSelfUser(u);
+      const selfTip = self ? ` disabled title="不能操作当前登录账号"` : "";
+      const actions =
+        `<button class="small" onclick="openUserEdit('${jsStr(u.id)}')">编辑</button>
+         <button class="small" onclick="resetUserPassword('${jsStr(u.id)}','${jsStr(u.username)}')">重置密码</button>
+         <button class="small"${selfTip} onclick="toggleUserEnabled('${jsStr(u.id)}',${u.enabled ? "true" : "false"})">${u.enabled ? "禁用" : "启用"}</button>
+         <button class="small danger"${selfTip} onclick="deleteUser('${jsStr(u.id)}','${jsStr(u.username)}')">删除</button>`;
+      return `<tr>
+        <td><code>${esc(u.username)}</code>${self ? ` <span class="user-flag">（当前）</span>` : ""}</td>
+        <td>${esc(u.displayName || "-")}</td>
+        <td>${esc(roleLabel(u.role))}</td>
+        <td>${userPermTags(u)}</td>
+        <td>${tag(u.enabled ? "启用" : "禁用", !!u.enabled)}</td>
+        <td class="muted">${fmtTime(u.lastLoginAt)}</td>
+        <td class="actions">${actions}</td>
+      </tr>`;
+    });
+    return `
+      <div class="hint-box">后台账号按模块授权，左侧菜单只显示已授权的模块。超级管理员拥有全部权限；不能禁用或删除当前登录账号，且需至少保留一个启用的超级管理员。</div>
+      <div class="panel"><h3>后台用户 <button class="primary small" onclick="openUserCreate()">新建用户</button></h3>
+        ${table(["用户名", "姓名", "角色", "权限", "状态", "最后登录", "操作"], rows,
+          S.usersLoaded ? "暂无用户数据，点击「新建用户」添加。" : "正在加载用户列表…")}</div>`;
+  }
+
+  async function loadUsers() {
+    try {
+      const list = await api("/api/v1/users");
+      S.users = Array.isArray(list) ? list : [];
+      S.usersLoaded = true;
+    } catch (e) {
+      if (S.token) toast(e.message, true);
+    }
+    renderNav();
+    if (S.tab === "users") render();
+  }
+
+  function userPermCheckboxes(perms) {
+    const set = perms || [];
+    return USER_MODULES.map((k) => {
+      const checked = set.includes(k) ? " checked" : "";
+      return `<label class="perm-item"><input type="checkbox" data-mperm="${k}"${checked}> ${esc(MODULE_LABELS[k])}</label>`;
+    }).join("");
+  }
+
+  function collectUserPerms() {
+    return Array.from($("modal-body").querySelectorAll("input[data-mperm]"))
+      .filter((el) => el.checked)
+      .map((el) => el.dataset.mperm);
+  }
+
+  window.openUserCreate = function () {
+    openModal("新建用户", `
+      <div class="form-row">
+        <div class="field"><label>用户名（登录账号）</label><input id="u_username" autocomplete="off"></div>
+        <div class="field"><label>姓名</label><input id="u_displayName"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>初始密码</label><input id="u_password" type="password" autocomplete="new-password"></div>
+        <div class="field"><label>角色</label><select id="u_role" onchange="applyRoleDefaultPerms(this.value)">${optionList(USER_ROLES, "v", (x) => x.label, "OPERATOR")}</select></div>
+      </div>
+      <div class="form-label" style="margin-top:4px">模块权限</div>
+      <div class="perm-grid">${userPermCheckboxes(["overview", "device", "tasks"])}</div>
+      <div class="desc" style="margin-top:10px">超级管理员自动拥有全部权限；切换角色会按岗位默认勾选模块，可手工微调。</div>`,
+      async () => {
+        const username = $("u_username").value.trim();
+        const password = $("u_password").value;
+        if (!username) throw new Error("用户名不能为空");
+        if (!password) throw new Error("密码不能为空");
+        await api("/api/v1/users", { method: "POST", body: {
+          username,
+          password,
+          displayName: $("u_displayName").value.trim(),
+          role: $("u_role").value,
+          permissions: collectUserPerms()
+        } });
+        toast("用户已创建");
+        await loadUsers();
+      }, true);
+  };
+
+  window.openUserEdit = function (id) {
+    const u = findUser(id);
+    if (!u) { toast("用户不存在，请刷新列表", true); return; }
+    const self = isSelfUser(u);
+    openModal("编辑用户：" + u.username, `
+      <div class="form-row">
+        <div class="field"><label>用户名（不可修改）</label><input value="${esc(u.username)}" disabled></div>
+        <div class="field"><label>姓名</label><input id="u_displayName" value="${esc(u.displayName || "")}"></div>
+      </div>
+      <div class="form-row">
+        <div class="field"><label>角色${self ? "（不能修改自己的角色）" : ""}</label>
+          <select id="u_role"${self ? " disabled" : ""} onchange="applyRoleDefaultPerms(this.value)">${optionList(USER_ROLES, "v", (x) => x.label, u.role)}</select></div>
+        <div class="field"><label class="check" style="margin-top:20px">
+          <input type="checkbox" id="u_enabled"${u.enabled ? " checked" : ""}${self ? " disabled" : ""}> 启用该账号</label></div>
+      </div>
+      <div class="form-label" style="margin-top:4px">模块权限</div>
+      <div class="perm-grid">${userPermCheckboxes(u.permissions)}</div>`,
+      async () => {
+        await api("/api/v1/users/" + encodeURIComponent(id), { method: "PUT", body: {
+          displayName: $("u_displayName").value.trim(),
+          role: self ? u.role : $("u_role").value,
+          permissions: collectUserPerms(),
+          enabled: self ? !!u.enabled : $("u_enabled").checked
+        } });
+        toast("用户已更新");
+        await loadUsers();
+      }, true);
+  };
+
+  window.resetUserPassword = async function (id, username) {
+    const pwd = prompt(`请输入「${username}」的新密码（至少 6 位）`);
+    if (pwd == null) return;
+    if (!pwd.trim()) { toast("密码不能为空", true); return; }
+    try {
+      const data = await api("/api/v1/users/" + encodeURIComponent(id) + "/reset-password", {
+        method: "POST", body: { newPassword: pwd }
+      });
+      toast((data && data.message) || "密码已重置");
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.toggleUserEnabled = async function (id, enabled) {
+    const u = findUser(id);
+    if (u && isSelfUser(u)) { toast("不能禁用当前登录账号", true); return; }
+    try {
+      await api("/api/v1/users/" + encodeURIComponent(id), { method: "PUT", body: { enabled: !enabled } });
+      toast(enabled ? "用户已禁用" : "用户已启用");
+      await loadUsers();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.deleteUser = async function (id, username) {
+    const u = findUser(id);
+    if (u && isSelfUser(u)) { toast("不能删除当前登录账号", true); return; }
+    if (!confirm(`确认删除用户「${username}」？删除后该账号将无法登录。`)) return;
+    try {
+      const data = await api("/api/v1/users/" + encodeURIComponent(id), { method: "DELETE" });
+      toast((data && data.message) || "用户已删除");
+      await loadUsers();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  window.changeMyPassword = function () {
+    openModal("修改密码", `
+      <div class="field"><label>当前密码</label><input id="p_old" type="password" autocomplete="current-password"></div>
+      <div class="field" style="margin-top:12px"><label>新密码</label><input id="p_new" type="password" autocomplete="new-password"></div>
+      <div class="field" style="margin-top:12px"><label>确认新密码</label><input id="p_new2" type="password" autocomplete="new-password"></div>
+      <div class="desc" style="margin-top:10px">修改成功后需要重新登录。</div>`,
+      async () => {
+        const oldPassword = $("p_old").value;
+        const newPassword = $("p_new").value;
+        if (!oldPassword || !newPassword) throw new Error("请填写当前密码与新密码");
+        if (newPassword !== $("p_new2").value) throw new Error("两次输入的新密码不一致");
+        await api("/api/v1/users/me/password", { method: "PUT", body: { oldPassword, newPassword } });
+        toast("密码已修改，请重新登录");
+        setTimeout(() => logout("密码已修改，请重新登录"), 900);
+      }, true);
+  };
+
   // ===== 删除 =====
   window.delEntity = async function (resource, id, label) {
     if (!confirm("确认删除该" + label + "？此操作会立即影响已同步的平板。")) return;
@@ -841,17 +1277,20 @@
 
   // ===== 弹窗 =====
   let modalSaveHandler = null;
+  let modalReload = true;
 
-  function openModal(title, bodyHtml, onSave) {
+  function openModal(title, bodyHtml, onSave, noReload) {
     $("modal-title").textContent = title;
     $("modal-body").innerHTML = bodyHtml;
     modalSaveHandler = onSave;
+    modalReload = !noReload;
     $("modal-mask").classList.add("show");
   }
 
   function closeModal() {
     $("modal-mask").classList.remove("show");
     modalSaveHandler = null;
+    modalReload = true;
   }
 
   $("modal-close").onclick = closeModal;
@@ -862,8 +1301,9 @@
     btn.disabled = true;
     try {
       await modalSaveHandler();
+      const reload = modalReload;
       closeModal();
-      await loadAll();
+      if (reload) await loadAll();
     } catch (e) {
       toast(e.message, true);
     } finally {
@@ -903,8 +1343,13 @@
   $("username").addEventListener("keydown", (e) => { if (e.key === "Enter") login(); });
   $("logout-btn").onclick = () => logout("已退出登录");
   $("logout-btn2").onclick = () => logout("已退出登录");
+  if ($("change-pwd-btn")) $("change-pwd-btn").onclick = () => changeMyPassword();
   $("refresh-btn").onclick = async () => {
-    try { await loadAll(); toast("已刷新"); } catch (e) { toast(e.message, true); }
+    try {
+      await loadAll();
+      if (S.tab === "users") await loadUsers();
+      toast("已刷新");
+    } catch (e) { toast(e.message, true); }
   };
 
   // 启动
@@ -916,6 +1361,8 @@
     if (S.token) {
       try {
         await api("/api/v1/auth/check");
+        await loadMe();
+        if (!S.token) return;
         enterApp();
         await loadAll();
         connectWs();

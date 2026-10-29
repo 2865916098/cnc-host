@@ -15,11 +15,9 @@ import com.cnc.gcode.post.fanuc.Fanuc0iPostProcessor
 import com.cnc.host.data.CamResult
 import com.cnc.host.data.CamSession
 import com.cnc.host.data.DeviceRepository
-import com.cnc.model.cam.MotionType
 import com.cnc.model.cam.ProcessStep
 import com.cnc.model.cam.ProcessType
 import com.cnc.model.cam.Toolpath
-import com.cnc.model.drawing.Point2D
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -74,6 +72,7 @@ class ReviewViewModel(
                 toolpath = tp,
                 gcode = result.gcode,
                 messages = tp.validation.messages,
+                unverifiedChecks = tp.validation.unverifiedChecks,
                 ready = tp.validation.messages.isEmpty() && tp.validation.noIllegalCoordinates,
                 machineFamily = result.selectedMachine,
                 sourceLabel = result.sourceLabel,
@@ -104,6 +103,7 @@ class ReviewViewModel(
                 toolpath = tp,
                 gcode = gcode,
                 messages = tp.validation.messages,
+                unverifiedChecks = tp.validation.unverifiedChecks,
                 ready = tp.validation.messages.isEmpty() && tp.validation.noIllegalCoordinates,
                 machineFamily = MachineFamily.FANUC_0I,
                 deviceConnected = device.isConnected(),
@@ -136,15 +136,9 @@ class ReviewViewModel(
 
             for ((idx, seg) in tp.segments.withIndex()) {
                 if (!isActive) break
-                val target = Point2D(seg.end.x, seg.end.y)
                 val cmdId = "ex-${idx}-${System.currentTimeMillis()}"
-                val cmd = when (seg.motionType) {
-                    MotionType.RAPID -> DeviceCommand.rapidMove(cmdId, null, target)
-                    MotionType.LINEAR_FEED -> DeviceCommand.linearFeed(
-                        cmdId, null, target, seg.feedMmPerMin.takeIf { it > 0 } ?: 100.0
-                    )
-                    MotionType.ARC_FEED -> DeviceCommand.linearFeed(cmdId, null, target, 100.0)
-                }
+                // R1 修复：圆弧段按 ARC_FEED 下发；缺圆心时 fromSegment 抛错，拒绝按弦加工
+                val cmd = DeviceCommand.fromSegment(cmdId, null, seg)
 
                 val result = device.sendMotionCommand(cmd)
 
@@ -232,6 +226,8 @@ data class ReviewUiState(
     val toolpath: Toolpath? = null,
     val gcode: com.cnc.gcode.post.GcodeProgram? = null,
     val messages: List<String> = emptyList(),
+    /** 验证器未执行的校验项（如毛坯碰撞），向操作员明示，不影响 ready。 */
+    val unverifiedChecks: List<String> = emptyList(),
     val ready: Boolean = false,
     val machineFamily: MachineFamily = MachineFamily.FANUC_0I,
     /** 刀路来源（图纸文件名 / 内置示例），便于确认审的是哪份程序。 */

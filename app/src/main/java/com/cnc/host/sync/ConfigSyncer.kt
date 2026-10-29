@@ -2,6 +2,7 @@ package com.cnc.host.sync
 
 import android.content.Context
 import androidx.room.withTransaction
+import com.cnc.host.data.DeviceRepository
 import com.cnc.host.persistence.BlankEntity
 import com.cnc.host.persistence.CncDatabase
 import com.cnc.host.persistence.DrawingCorrectionEntity
@@ -143,6 +144,9 @@ object ConfigSyncer {
             deviceJson = gson.toJson(device),
             commJson = gson.toJson(device.comm)
         )
+
+        // 按服务端下发的驱动配置切换设备驱动（默认/异常均回退模拟器）
+        DeviceRepository.shared.applyServerConfig(device)
         Unit
     }
 }

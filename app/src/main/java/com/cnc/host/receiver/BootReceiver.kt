@@ -13,7 +13,9 @@ import com.cnc.host.MainActivity
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        if (intent.action != Intent.ACTION_BOOT_COMPLETED &&
+            intent.action != "android.intent.action.QUICKBOOT_POWERON"
+        ) return
         // 拉起主界面；保活服务由 MainActivity.onResume 在前台启动，
         // 避免开机广播这种后台场景直接起前台服务被系统判定超时崩溃
         runCatching {

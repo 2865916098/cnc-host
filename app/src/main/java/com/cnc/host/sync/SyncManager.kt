@@ -21,7 +21,9 @@ data class SyncState(
     val cachedVersion: Long = 0,
     val lastSyncAt: Long? = null,
     val lastError: String? = null,
-    val lastMessage: String = ""
+    val lastMessage: String = "",
+    /** 待补传任务数（P2-④ 弱网/离线提示）。 */
+    val pendingCount: Int = 0
 )
 
 data class SyncOutcome(val version: Long, val changed: Boolean)
@@ -50,7 +52,8 @@ object SyncManager {
             it.copy(
                 configured = settings.configured,
                 cachedVersion = version,
-                lastSyncAt = lastAt
+                lastSyncAt = lastAt,
+                pendingCount = pendingCount(context)
             )
         }
     }
@@ -58,6 +61,24 @@ object SyncManager {
     suspend fun saveSettings(context: Context, settings: ServerSettings) {
         ServerPrefs.save(context, settings)
         _state.update { it.copy(configured = settings.configured, lastMessage = "设置已保存") }
+    }
+
+    /** 心跳结果联动在线状态（任务页徽标实时刷新），不触碰其它字段。 */
+    fun markOnline(online: Boolean) {
+        _state.update { it.copy(online = online) }
+    }
+
+    /**
+     * 轻量探测远端配置版本是否与本地缓存不同。
+     * 未配置鉴权或网络失败时返回 false（不触发同步）。
+     */
+    suspend fun remoteConfigChanged(context: Context): Boolean {
+        val conf = ServerPrefs.load(context)
+        if (!conf.configured) return false
+        val remote = ServerApi(conf).fetchConfigVersion().getOrNull() ?: return false
+        val cached = CncDatabase.getInstance(context).syncMetaDao()
+            .get("config_version")?.value?.toLongOrNull() ?: 0L
+        return remote.version != cached
     }
 
     /** 仅验证地址与口令，不写配置。 */
@@ -102,7 +123,8 @@ object SyncManager {
                         syncing = false,
                         online = false,
                         lastError = message,
-                        lastMessage = "同步失败，继续使用本地缓存"
+                        lastMessage = "同步失败，继续使用本地缓存",
+                        pendingCount = pendingCount(context)
                     )
                 }
                 return Result.failure(Exception(message, remote.exceptionOrNull()))
@@ -146,7 +168,8 @@ object SyncManager {
                         changed -> "已同步到配置版本 v${config.version}"
                         flushed > 0 -> "配置无变化，已补传 $flushed 条任务"
                         else -> "配置已是最新版本 v${config.version}"
-                    }
+                    },
+                    pendingCount = pendingCount(context)
                 )
             }
             return Result.success(SyncOutcome(config.version, changed))
@@ -171,7 +194,8 @@ object SyncManager {
             id = entity.id,
             partName = entity.partName,
             planId = entity.planId,
-            status = entity.status,
+            status = entity.state,
+            state = entity.state,
             durationSec = entity.durationSec,
             operator = operator,
             startedAt = entity.startedAt,
@@ -190,6 +214,8 @@ object SyncManager {
             } else {
                 flushPendingTasksLocked(context, api)
             }
+            // 刷新待补传计数（P2-④ 弱网/离线提示）
+            _state.update { it.copy(pendingCount = pendingCount(context)) }
         }
     }
 

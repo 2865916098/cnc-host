@@ -90,9 +90,12 @@ private fun StatCard(label: String, value: String, color: Color) {
 @Composable
 private fun TaskRow(t: TaskItem) {
     val (bg, fg, label) = when (t.status) {
-        HistoryStatus.SUCCESS -> Triple(Color(0xFF1A3A2A), Color(0xFF4CAF50), "成功")
+        HistoryStatus.PENDING_REVIEW -> Triple(Color(0xFF2A2A3A), Color(0xFF9E9E9E), "待审")
+        HistoryStatus.READY -> Triple(Color(0xFF1A2A3A), Color(0xFF42A5F5), "就绪")
+        HistoryStatus.RUNNING -> Triple(Color(0xFF1A3A2A), Color(0xFF66BB6A), "执行中")
+        HistoryStatus.SUCCESS -> Triple(Color(0xFF1A3A2A), Color(0xFF4CAF50), "完成")
         HistoryStatus.FAILED -> Triple(Color(0xFF3A1A1A), Color(0xFFEF5350), "失败")
-        HistoryStatus.ABORTED -> Triple(Color(0xFF3A3015), Color(0xFFFFA500), "中断")
+        HistoryStatus.ABORTED -> Triple(Color(0xFF3A3015), Color(0xFFFFA500), "中止")
     }
     Row(
         Modifier.fillMaxWidth().background(bg, RoundedCornerShape(6.dp))

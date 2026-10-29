@@ -13,7 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
@@ -24,6 +24,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cnc.ui.theme.CncColors
@@ -76,18 +77,18 @@ private fun TcpFields(c: CommConfig, vm: CommViewModel) {
     var timeout by remember(c.timeoutMs) { mutableStateOf(c.timeoutMs.toString()) }
 
     Text("IP 地址", style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-    OutlinedTextField(ip, onValueChange = { ip = it; vm.update { cfg -> cfg.copy(ipAddress = it) } }, Modifier.fillMaxWidth(), singleLine = true)
+    KioskTextField(ip, onValueChange = { ip = it; vm.update { cfg -> cfg.copy(ipAddress = it) } }, Modifier.fillMaxWidth(), singleLine = true)
     Spacer(Modifier.height(6.dp))
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Column(Modifier.fillMaxWidth()) {
             Text("端口", style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-            OutlinedTextField(port, onValueChange = { port = it.toIntOrNull()?.toString() ?: port; it.toIntOrNull()?.let { v -> vm.update { cfg -> cfg.copy(port = v) } } },
-                Modifier.fillMaxWidth(), singleLine = true)
+            KioskTextField(port, onValueChange = { port = it.toIntOrNull()?.toString() ?: port; it.toIntOrNull()?.let { v -> vm.update { cfg -> cfg.copy(port = v) } } },
+                Modifier.fillMaxWidth(), singleLine = true, keyboardType = KeyboardType.Number)
         }
         Column(Modifier.fillMaxWidth()) {
             Text("超时 (ms)", style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-            OutlinedTextField(timeout, onValueChange = { timeout = it; it.toLongOrNull()?.let { v -> vm.update { cfg -> cfg.copy(timeoutMs = v) } } },
-                Modifier.fillMaxWidth(), singleLine = true)
+            KioskTextField(timeout, onValueChange = { timeout = it; it.toLongOrNull()?.let { v -> vm.update { cfg -> cfg.copy(timeoutMs = v) } } },
+                Modifier.fillMaxWidth(), singleLine = true, keyboardType = KeyboardType.Number)
         }
     }
 }
@@ -98,7 +99,7 @@ private fun SerialFields(c: CommConfig, vm: CommViewModel) {
     var baud by remember(c.baudRate) { mutableStateOf(c.baudRate.name) }
 
     Text("串口设备", style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-    OutlinedTextField(port, onValueChange = { port = it; vm.update { cfg -> cfg.copy(serialPort = it) } }, Modifier.fillMaxWidth(), singleLine = true)
+    KioskTextField(port, onValueChange = { port = it; vm.update { cfg -> cfg.copy(serialPort = it) } }, Modifier.fillMaxWidth(), singleLine = true)
     Spacer(Modifier.height(6.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         BaudRate.values().forEach { b ->

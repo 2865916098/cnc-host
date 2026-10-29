@@ -16,7 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import com.cnc.host.ui.components.KioskTextField
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -30,6 +30,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.cnc.model.drawing.BoundingBox
@@ -168,8 +169,8 @@ private fun NumberField(label: String, value: Double, onChange: (Double) -> Unit
     Row(verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
         Text(label, style = CncTypography.bodySmall, color = CncColors.TextPrimary)
-        OutlinedTextField(value = text, onValueChange = { text = it; it.toDoubleOrNull()?.let(onChange) },
-            modifier = Modifier, singleLine = true)
+        KioskTextField(value = text, onValueChange = { text = it; it.toDoubleOrNull()?.let(onChange) },
+            modifier = Modifier, singleLine = true, keyboardType = KeyboardType.Decimal)
     }
 }
 

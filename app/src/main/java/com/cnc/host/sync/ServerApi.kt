@@ -37,6 +37,11 @@ class ServerApi(private val settings: ServerSettings) {
         gson.fromJson(request("GET", "/api/v1/config"), ConfigDto::class.java)
     }
 
+    /** 轻量配置版本探测（心跳用，避免每次拉全量配置）。 */
+    suspend fun fetchConfigVersion(): Result<ConfigVersionDto> = runCatching {
+        gson.fromJson(request("GET", "/api/v1/config/version"), ConfigVersionDto::class.java)
+    }
+
     suspend fun uploadTask(task: TaskDto): Result<Unit> = runCatching {
         request("POST", "/api/v1/tasks", gson.toJson(task))
         Unit
@@ -110,6 +115,12 @@ class ServerApi(private val settings: ServerSettings) {
             request("POST", "/api/v1/devices/$deviceId/verify-admin", gson.toJson(AdminVerifyRequestDto(password))),
             SimpleOkDto::class.java
         )
+    }
+
+    /** 批量上传操作日志到服务端（bearer("device") 保护）。 */
+    suspend fun uploadLogs(req: UploadLogsRequestDto): Result<Unit> = runCatching {
+        request("POST", "/api/v1/logs", gson.toJson(req))
+        Unit
     }
 
     private suspend fun request(method: String, path: String, body: String? = null): String =

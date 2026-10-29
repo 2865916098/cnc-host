@@ -49,6 +49,7 @@ dependencies {
     implementation(project(":core-ui"))
     implementation(project(":device-api"))
     implementation(project(":device-simulator"))
+    implementation(project(":device-modbus"))
     implementation(project(":dxf-parser"))
     implementation(project(":cam-engine"))
     implementation(project(":gcode-post"))
@@ -78,6 +79,7 @@ dependencies {
 
     // Testing
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
     testImplementation("androidx.test.ext:junit:1.2.1")
     testImplementation("androidx.test.espresso:espresso-core:3.6.1")
     androidTestImplementation(platform("androidx.compose:compose-bom:2024.09.03"))

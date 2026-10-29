@@ -1,11 +1,14 @@
 package com.cnc.server
 
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.HttpHeaders
 import io.ktor.http.content.PartData
 import io.ktor.http.content.forEachPart
 import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.Application
+import io.ktor.server.application.ApplicationCall
+import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.application.install
 import io.ktor.server.application.log
@@ -15,7 +18,10 @@ import io.ktor.server.auth.bearer
 import io.ktor.server.plugins.callloging.CallLogging
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.cors.routing.CORS
+import io.ktor.server.plugins.origin
 import io.ktor.server.plugins.statuspages.StatusPages
+import io.ktor.server.request.httpMethod
+import io.ktor.server.request.path
 import io.ktor.server.request.receive
 import io.ktor.server.request.receiveMultipart
 import io.ktor.server.response.header
@@ -59,6 +65,99 @@ private fun sha256Of(file: File): String {
     return digest.digest().joinToString("") { "%02x".format(it) }
 }
 
+/** 当前请求的 Bearer token。 */
+private fun ApplicationCall.bearerToken(): String =
+    request.headers[HttpHeaders.Authorization].orEmpty().removePrefix("Bearer").trim()
+
+/** 租户上下文（ADR-0002）：取请求头 X-Tenant-Id，缺省回退默认租户。 */
+private fun ApplicationCall.tenantId(): String = Db.normalizeTenant(request.headers["X-Tenant-Id"])
+
+/** CSV 字段转义：含逗号/引号/换行时加双引号并转义内部引号。 */
+private fun csvCell(v: Any?): String {
+    val s = v?.toString() ?: ""
+    return if (s.contains('"') || s.contains(',') || s.contains('\n')) {
+        "\"" + s.replace("\"", "\"\"") + "\""
+    } else s
+}
+
+private fun csvLine(vararg cols: Any?): String = cols.joinToString(",") { csvCell(it) }
+
+/** 毫秒时间戳 → yyyy-MM-dd HH:mm:ss（本地时区）。 */
+private fun fmtTs(ms: Long): String =
+    if (ms <= 0L) "" else java.time.Instant.ofEpochMilli(ms)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+
+/** 统一导出响应：format=csv 下载文件，否则返回 JSON。 */
+private suspend fun ApplicationCall.respondExport(
+    filename: String,
+    headers: List<String>,
+    rows: List<List<Any?>>,
+    jsonBody: Any
+) {
+    val format = request.queryParameters["format"]?.lowercase()?.takeIf { it == "json" }
+    if (format == "json") {
+        respond(jsonBody)
+    } else {
+        val csv = buildString {
+            appendLine(headers.joinToString(",") { csvCell(it) })
+            rows.forEach { appendLine(it.joinToString(",") { c -> csvCell(c) }) }
+        }
+        response.header("Content-Disposition", "attachment; filename=\"$filename.csv\"")
+        respondText(csv, ContentType.parse("text/csv; charset=utf-8"))
+    }
+}
+
+/** 解析时间范围查询参数（毫秒时间戳，可空）。 */
+private fun ApplicationCall.rangeParam(): Pair<Long?, Long?> =
+    request.queryParameters["from"]?.toLongOrNull() to request.queryParameters["to"]?.toLongOrNull()
+
+/** 管理端操作者：环境变量口令 / 设备令牌视为超管虚拟账号。 */
+private data class AdminActor(
+    val id: String,
+    val username: String,
+    val role: String,
+    val isSuper: Boolean
+)
+
+private fun adminActorOf(call: ApplicationCall, adminToken: String): AdminActor? {
+    val token = call.bearerToken()
+    if (token == adminToken || Db.isValidDeviceToken(token)) {
+        return AdminActor(id = "", username = Db.adminUsername(), role = ROLE_SUPER_ADMIN, isSuper = true)
+    }
+    val user = Db.getSessionUser(token) ?: return null
+    return AdminActor(user.id, user.username, user.role, user.role == ROLE_SUPER_ADMIN)
+}
+
+private val USER_ROLES = setOf(ROLE_SUPER_ADMIN, ROLE_ADMIN, ROLE_PROCESS_ENGINEER, ROLE_OPERATOR, ROLE_QUALITY)
+
+/**
+ * 管理端「方法 + 路径」权限映射；返回 null 表示所有已登录用户可访问。
+ * 模块 key 与前端导航一致：overview/device/tools/materials/parts/plans/
+ * drawings/devices/tasks/users/app/logs。
+ */
+private fun requiredPermission(method: String, path: String): String? {
+    val p = path.substringAfter("/api/v1", path)
+    return when {
+        // 查看本人信息 / 修改本人密码属于基础能力，不受 users 模块权限限制
+        p == "/users/me" || p == "/users/me/password" -> null
+        p.contains("/users") || p.contains("/admin-password") -> "users"
+        p.contains("/app-publish") || p.contains("/app-latest-candidate") -> "app"
+        p.contains("/materials") -> "materials"
+        p.contains("/parts") || p.contains("/blanks") -> "parts"
+        p.contains("/plans") || p.contains("/process-steps") -> "plans"
+        p.contains("/drawings") || p.contains("/corrections") -> "drawings"
+        p.contains("/tools") -> "tools"
+        p.contains("/devices") -> "devices"
+        p.contains("/tasks") -> "tasks"
+        p.contains("/logs") -> "logs"
+        method == "PUT" && p == "/device" -> "device"
+        p == "/config" || p.startsWith("/config/") ||
+            p == "/auth/check" || p == "/status" || p == "/admin/logout" -> null
+        else -> null
+    }
+}
+
 /**
  * 服务端装配。
  *
@@ -71,6 +170,12 @@ fun Application.cncServerModule(adminToken: String) {
 
     val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; prettyPrint = true }
 
+    // R5：敏感开放接口限流（按客户端 IP，进程内滑动窗口，超限返回 429）
+    val loginLimiter = RateLimiter(maxRequests = 5, windowMs = 60_000)
+    val registerLimiter = RateLimiter(maxRequests = 10, windowMs = 60_000)
+    // 正常心跳周期 10 秒（6 次/分钟），限 60 次/分钟留出充足余量
+    val heartbeatLimiter = RateLimiter(maxRequests = 60, windowMs = 60_000)
+
     install(ContentNegotiation) { json(json) }
     install(CallLogging) { level = Level.INFO }
     install(CORS) {
@@ -78,6 +183,7 @@ fun Application.cncServerModule(adminToken: String) {
         allowHeader("Authorization")
         allowHeader("Content-Type")
         allowHeader("X-Auth-Token")
+        allowHeader("X-Tenant-Id")
     }
     install(WebSockets)
     install(StatusPages) {
@@ -90,10 +196,22 @@ fun Application.cncServerModule(adminToken: String) {
         }
     }
     install(Authentication) {
+        bearer("device") {
+            authenticate { credential ->
+                if (Db.isValidDeviceToken(credential.token)) {
+                    io.ktor.server.auth.UserIdPrincipal("device")
+                } else {
+                    null
+                }
+            }
+        }
         bearer("admin") {
             authenticate { credential ->
-                // 兼容环境变量管理口令，以及账号密码登录签发的会话 token
-                if (credential.token == adminToken || Db.isValidSession(credential.token)) {
+                // 兼容：环境变量管理口令 / 后台登录会话 token / 注册设备的设备令牌
+                if (credential.token == adminToken ||
+                    Db.isValidSession(credential.token) ||
+                    Db.isValidDeviceToken(credential.token)
+                ) {
                     io.ktor.server.auth.UserIdPrincipal("admin")
                 } else {
                     null
@@ -136,18 +254,31 @@ fun Application.cncServerModule(adminToken: String) {
 
         // 设备注册与心跳（开放接口，注册前客户端尚无管理口令）
         route("/api/v1") {
-            // 管理后台账号密码登录（开放接口）
+            // 管理后台账号密码登录（开放接口，R5：按 IP 限流防爆破）
             post("/admin/login") {
+                if (!loginLimiter.allow(call.request.origin.remoteHost)) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        AdminLoginResult(ok = false, message = "尝试过于频繁，请 1 分钟后再试")
+                    )
+                    return@post
+                }
                 val req = call.receive<AdminLoginRequest>()
-                if (Db.verifyAdminAccount(req.username, req.password)) {
-                    val token = Db.createSession(req.username)
+                val tenant = call.tenantId()
+                if (Db.verifyAdminAccount(req.username, req.password, tenant)) {
+                    // users 表中存在该账号时带出角色/权限；老库回退登录时按超管处理
+                    val account = Db.findUserByUsername(req.username, tenant)
+                    val token = Db.createSession(req.username, account?.id ?: "", tenant)
                     call.respond(
                         AdminLoginResult(
                             ok = true,
                             message = "登录成功",
                             token = token,
                             username = req.username,
-                            expiresAt = System.currentTimeMillis() + Db.SESSION_TTL_MS
+                            expiresAt = System.currentTimeMillis() + Db.SESSION_TTL_MS,
+                            role = account?.role ?: ROLE_SUPER_ADMIN,
+                            permissions = account?.permissions ?: emptyList(),
+                            displayName = account?.displayName ?: req.username
                         )
                     )
                 } else {
@@ -158,38 +289,31 @@ fun Application.cncServerModule(adminToken: String) {
                 }
             }
             post("/devices/register") {
-                val req = call.receive<RegisterRequest>()
-                // 同一台设备（按硬件标识）只能注册一次；需后台注销后才能重新注册
-                if (req.hardwareId.isNotBlank()) {
-                    val existing = Db.findByHardwareId(req.hardwareId)
-                    if (existing != null) {
-                        call.respond(
-                            HttpStatusCode.Conflict,
-                            SimpleResult(ok = false, message = "设备已注册，如需重新注册请联系管理员")
-                        )
-                        return@post
-                    }
-                }
-                val info = runCatching { Db.registerDevice(req) }.getOrElse {
-                    // 兜底：并发下唯一索引冲突
+                if (!registerLimiter.allow(call.request.origin.remoteHost)) {
                     call.respond(
-                        HttpStatusCode.Conflict,
-                        SimpleResult(ok = false, message = "设备已注册，如需重新注册请联系管理员")
+                        HttpStatusCode.TooManyRequests,
+                        SimpleResult(ok = false, message = "注册请求过于频繁，请稍后再试")
                     )
                     return@post
                 }
+                val req = call.receive<RegisterRequest>()
+                // 设备激活：按 hardwareId 幂等（同一硬件重复激活 = 同一台设备）。
+                // 客户端「清除数据」后本地令牌会丢失，若拒绝激活将永久卡死，
+                // 因此这里不再返回 409，由数据层更新原记录并保留原令牌。
+                val info = Db.registerDevice(req, call.tenantId())
                 call.respond(info)
             }
-            get("/devices/{id}") {
-                val id = call.parameters["id"].orEmpty()
-                val info = Db.getDevice(id)
-                if (info != null) call.respond(info)
-                else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
-            }
             post("/devices/{id}/heartbeat") {
+                if (!heartbeatLimiter.allow(call.request.origin.remoteHost)) {
+                    call.respond(
+                        HttpStatusCode.TooManyRequests,
+                        SimpleResult(ok = false, message = "心跳过于频繁，请稍后再试")
+                    )
+                    return@post
+                }
                 val id = call.parameters["id"].orEmpty()
                 val req = runCatching { call.receive<HeartbeatRequest>() }.getOrDefault(HeartbeatRequest())
-                val info = Db.heartbeat(id, req.appVersion)
+                val info = Db.heartbeat(id, req.appVersion, call.tenantId())
                 if (info != null) call.respond(info)
                 else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在或已注销"))
             }
@@ -211,7 +335,7 @@ fun Application.cncServerModule(adminToken: String) {
             }
             post("/devices/{id}/verify-admin") {
                 val id = call.parameters["id"].orEmpty()
-                if (Db.getDevice(id) == null) {
+                if (Db.getDevice(id, call.tenantId()) == null) {
                     call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
                     return@post
                 }
@@ -221,8 +345,275 @@ fun Application.cncServerModule(adminToken: String) {
             }
         }
 
+        // 操作日志：设备批量上传（bearer("device") 保护，心跳自动补传）
+        authenticate("device") {
+            route("/api/v1") {
+                post("/logs") {
+                    // 设备令牌绑定租户：令牌租户与请求头不一致时拒绝，防止跨租户写入
+                    val tokenTenant = Db.tenantIdOfDeviceToken(call.bearerToken())
+                    if (tokenTenant != null && tokenTenant != call.tenantId()) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
+                        return@post
+                    }
+                    val req = call.receive<UploadLogsRequest>()
+                    Db.insertLogs(req.deviceId, req.logs, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已接收 ${req.logs.size} 条日志"))
+                }
+            }
+        }
+
         authenticate("admin") {
             route("/api/v1") {
+                // ===== 权限拦截：环境变量口令 / 设备令牌放行；超管放行；其余按模块授权 =====
+                intercept(ApplicationCallPipeline.Call) {
+                    val token = call.bearerToken()
+                    if (token == adminToken) return@intercept
+                    if (Db.isValidDeviceToken(token)) {
+                        // 设备令牌绑定租户：请求头租户与令牌所属租户不一致时拒绝
+                        val tokenTenant = Db.tenantIdOfDeviceToken(token)
+                        if (tokenTenant != null && tokenTenant != call.tenantId()) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
+                            finish()
+                            return@intercept
+                        }
+                        // R6 收紧：设备令牌白名单——仅允许读配置/自检/查本机 + 回传任务记录/实时状态，
+                        // 其余一律 403（含 /logs、/users、设备列表、写配置等）
+                        val m = call.request.httpMethod.value
+                        val p = call.request.path()
+                        val deviceSub = p.removePrefix("/api/v1/devices/")
+                        val isSingleDeviceGet = m == "GET" && p.startsWith("/api/v1/devices/") &&
+                            deviceSub.isNotBlank() && !deviceSub.contains("/") && deviceSub != "org-summary"
+                        val allowed = isSingleDeviceGet ||
+                            (m == "GET" && (p == "/api/v1/auth/check" || p == "/api/v1/config" || p.startsWith("/api/v1/config/"))) ||
+                            (m == "POST" && (p == "/api/v1/tasks" || p == "/api/v1/status"))
+                        if (!allowed) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌仅允许同步配置与回传数据"))
+                            finish()
+                        }
+                        return@intercept
+                    }
+                    // 会话仍有效但账号被禁用/删除时，getSessionUser 返回 null，必须拒绝
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        finish()
+                        return@intercept
+                    }
+                    // 会话绑定租户：请求头租户与会话所属租户不一致时拒绝（ADR-0002）
+                    if (user.tenantId != call.tenantId()) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
+                        finish()
+                        return@intercept
+                    }
+                    if (user.role == ROLE_SUPER_ADMIN) return@intercept
+                    val method = call.request.httpMethod.value
+                    val path = call.request.path()
+                    val required = requiredPermission(method, path) ?: return@intercept
+                    // R6 收紧：GET 不再宽松放行，与其它方法一样按模块权限校验
+                    if (!user.permissions.contains(required)) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        finish()
+                        return@intercept
+                    }
+                    // ADR-0003：只读角色（如质检员）对已授权模块仅放行 GET/HEAD，写操作一律拒绝
+                    if (readOnlyModulesForRole(user.role).contains(required) && method != "GET" && method != "HEAD") {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "该角色对该模块仅有只读权限"))
+                        finish()
+                        return@intercept
+                    }
+                }
+
+                // ===== 当前账号 =====
+                get("/users/me") {
+                    val token = call.bearerToken()
+                    if (Db.isValidDeviceToken(token)) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌无权访问账号管理"))
+                        return@get
+                    }
+                    if (token == adminToken) {
+                        call.respond(
+                            SessionUserDto(
+                                id = "", username = Db.adminUsername(), displayName = "超级管理员",
+                                role = ROLE_SUPER_ADMIN, permissions = emptyList(), superAdmin = true
+                            )
+                        )
+                        return@get
+                    }
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        return@get
+                    }
+                    call.respond(
+                        SessionUserDto(
+                            id = user.id, username = user.username, displayName = user.displayName,
+                            role = user.role, permissions = user.permissions,
+                            superAdmin = user.role == ROLE_SUPER_ADMIN
+                        )
+                    )
+                }
+
+                // ===== 用户管理 =====
+                get("/users") {
+                    call.respond(Db.listUsers(call.tenantId()))
+                }
+
+                post("/users") {
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val body = call.receive<CreateUserRequest>()
+                    if (body.username.isBlank()) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "用户名不能为空"))
+                        return@post
+                    }
+                    if (body.password.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@post
+                    }
+                    if (body.role !in USER_ROLES) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "无效的角色"))
+                        return@post
+                    }
+                    if (body.role == ROLE_SUPER_ADMIN && !actor.isSuper) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@post
+                    }
+                    val result = runCatching {
+                        Db.createUser(body.username.trim(), body.password, body.displayName, body.role, body.permissions, tenantId = call.tenantId())
+                    }
+                    val error = result.exceptionOrNull()
+                    if (error is IllegalArgumentException) {
+                        call.respond(HttpStatusCode.Conflict, SimpleResult(ok = false, message = error.message ?: "用户名已存在"))
+                        return@post
+                    }
+                    call.respond(result.getOrElse { throw it })
+                }
+
+                // 改本人密码：需在 /users/{id} 之前注册；成功后强制重新登录
+                put("/users/me/password") {
+                    val token = call.bearerToken()
+                    if (token == adminToken || Db.isValidDeviceToken(token)) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "当前登录方式无需修改密码"))
+                        return@put
+                    }
+                    val user = Db.getSessionUser(token)
+                    if (user == null) {
+                        call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        return@put
+                    }
+                    val body = call.receive<ChangePasswordRequest>()
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@put
+                    }
+                    if (!Db.changeOwnPassword(user.id, body.oldPassword, body.newPassword, user.tenantId)) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "原密码错误"))
+                        return@put
+                    }
+                    Db.deleteUserSessions(user.id, user.username)
+                    call.respond(SimpleResult(ok = true, message = "密码已修改，请重新登录"))
+                }
+
+                put("/users/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@put call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id, call.tenantId())
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@put
+                    }
+                    val body = call.receive<UpdateUserRequest>()
+                    // 非超管不能修改超管账号，也不能把普通账号提升为超管
+                    if (!actor.isSuper && (target.role == ROLE_SUPER_ADMIN || body.role == ROLE_SUPER_ADMIN)) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@put
+                    }
+                    val newRole = body.role ?: target.role
+                    if (newRole !in USER_ROLES) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "无效的角色"))
+                        return@put
+                    }
+                    if (body.enabled == false && actor.id == id) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "不能禁用自己"))
+                        return@put
+                    }
+                    if (target.role == ROLE_SUPER_ADMIN &&
+                        (newRole != ROLE_SUPER_ADMIN || body.enabled == false) &&
+                        Db.countSuperAdmins(call.tenantId()) <= 1
+                    ) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
+                        return@put
+                    }
+                    val updated = Db.updateUser(
+                        id = id,
+                        displayName = body.displayName?.ifBlank { target.displayName } ?: target.displayName,
+                        role = newRole,
+                        permissions = body.permissions ?: target.permissions,
+                        enabled = body.enabled ?: target.enabled,
+                        tenantId = call.tenantId()
+                    )
+                    if (updated == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                    } else {
+                        call.respond(updated)
+                    }
+                }
+
+                delete("/users/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@delete call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id, call.tenantId())
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@delete
+                    }
+                    if (actor.id == id) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "不能删除自己"))
+                        return@delete
+                    }
+                    if (!actor.isSuper && target.role == ROLE_SUPER_ADMIN) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@delete
+                    }
+                    if (target.role == ROLE_SUPER_ADMIN && Db.countSuperAdmins(call.tenantId()) <= 1) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
+                        return@delete
+                    }
+                    if (!Db.deleteUser(id, call.tenantId())) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                    } else {
+                        call.respond(SimpleResult(ok = true, message = "用户已删除"))
+                    }
+                }
+
+                post("/users/{id}/reset-password") {
+                    val id = call.parameters["id"].orEmpty()
+                    val actor = adminActorOf(call, adminToken)
+                        ?: return@post call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                    val target = Db.findUserById(id, call.tenantId())
+                    if (target == null) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@post
+                    }
+                    if (!actor.isSuper && target.role == ROLE_SUPER_ADMIN) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
+                        return@post
+                    }
+                    val body = call.receive<ResetPasswordRequest>()
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@post
+                    }
+                    if (!Db.resetUserPassword(id, body.newPassword, call.tenantId())) {
+                        call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
+                        return@post
+                    }
+                    Db.deleteUserSessions(target.id, target.username)
+                    call.respond(SimpleResult(ok = true, message = "密码已重置"))
+                }
+
                 get("/auth/check") {
                     call.respond(SimpleResult(ok = true, message = "token valid"))
                 }
@@ -236,7 +627,7 @@ fun Application.cncServerModule(adminToken: String) {
                 }
 
                 get("/config") {
-                    call.respond(Db.snapshot())
+                    call.respond(Db.snapshot(call.tenantId()))
                 }
 
                 get("/config/version") {
@@ -251,66 +642,144 @@ fun Application.cncServerModule(adminToken: String) {
 
                 // ===== 刀具 =====
                 post("/tools") {
-                    val saved = Db.upsertTool(call.receive<ToolConfig>())
+                    val saved = Db.upsertTool(call.receive<ToolConfig>(), call.tenantId())
                     call.respond(saved)
                 }
                 delete("/tools/{id}") {
-                    Db.deleteTool(call.parameters["id"].orEmpty())
+                    Db.deleteTool(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "刀具已删除"))
                 }
 
                 // ===== 材料 =====
                 post("/materials") {
-                    call.respond(Db.upsertMaterial(call.receive<MaterialConfig>()))
+                    call.respond(Db.upsertMaterial(call.receive<MaterialConfig>(), call.tenantId()))
                 }
                 delete("/materials/{id}") {
-                    Db.deleteMaterial(call.parameters["id"].orEmpty())
+                    Db.deleteMaterial(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "材料已删除"))
                 }
 
                 // ===== 零件 / 毛坯 =====
                 post("/parts") {
-                    call.respond(Db.upsertPart(call.receive<PartConfig>()))
+                    call.respond(Db.upsertPart(call.receive<PartConfig>(), call.tenantId()))
                 }
                 delete("/parts/{id}") {
-                    Db.deletePart(call.parameters["id"].orEmpty())
+                    Db.deletePart(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "零件已删除"))
                 }
                 post("/blanks") {
-                    call.respond(Db.upsertBlank(call.receive<BlankConfig>()))
+                    call.respond(Db.upsertBlank(call.receive<BlankConfig>(), call.tenantId()))
                 }
                 delete("/blanks/{id}") {
-                    Db.deleteBlank(call.parameters["id"].orEmpty())
+                    Db.deleteBlank(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "毛坯已删除"))
                 }
 
                 // ===== 工艺方案 =====
                 post("/plans") {
-                    call.respond(Db.upsertPlan(call.receive<ProcessPlanConfig>()))
+                    call.respond(Db.upsertPlan(call.receive<ProcessPlanConfig>(), call.tenantId()))
                 }
                 delete("/plans/{id}") {
-                    Db.deletePlan(call.parameters["id"].orEmpty())
+                    Db.deletePlan(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "工艺方案已删除"))
                 }
 
                 // ===== 图纸 =====
                 post("/drawings") {
-                    call.respond(Db.upsertDrawing(call.receive<DrawingConfig>()))
+                    call.respond(Db.upsertDrawing(call.receive<DrawingConfig>(), call.tenantId()))
                 }
                 delete("/drawings/{id}") {
-                    Db.deleteDrawing(call.parameters["id"].orEmpty())
+                    Db.deleteDrawing(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "图纸已删除"))
                 }
                 post("/corrections") {
-                    call.respond(Db.upsertCorrection(call.receive<DrawingCorrectionConfig>()))
+                    call.respond(Db.upsertCorrection(call.receive<DrawingCorrectionConfig>(), call.tenantId()))
                 }
 
                 // ===== 任务记录 =====
                 get("/tasks") {
-                    call.respond(Db.tasks())
+                    call.respond(Db.tasks(tenantId = call.tenantId()))
                 }
                 post("/tasks") {
-                    call.respond(Db.upsertTask(call.receive<TaskRecord>()))
+                    call.respond(Db.upsertTask(call.receive<TaskRecord>(), call.tenantId()))
+                }
+
+                // ===== 操作日志（管理端查询/清理）=====
+                get("/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 500
+                    call.respond(Db.listLogs(deviceId, limit, call.tenantId()))
+                }
+                delete("/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val olderThanMs = call.request.queryParameters["olderThanMs"]?.toLongOrNull()
+                        ?: (System.currentTimeMillis() - 7L * 24 * 3600 * 1000)
+                    val deleted = Db.deleteLogsByRange(deviceId, from = null, to = olderThanMs, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已清理 $deleted 条日志"))
+                }
+
+                // ===== 数据导出 / 按范围清理（租户隔离，from/to 为毫秒时间戳）=====
+                get("/export/devices") {
+                    val (from, to) = call.rangeParam()
+                    val devices = Db.listDevices(call.tenantId()).filter { d ->
+                        (from == null || d.registeredAt >= from) && (to == null || d.registeredAt <= to)
+                    }
+                    call.respondExport(
+                        filename = "devices",
+                        headers = listOf("设备ID", "单位名称", "联系人", "电话", "省份", "城市", "服务端地址", "注册时间", "最后在线", "在线状态", "App版本"),
+                        rows = devices.map {
+                            listOf(it.id, it.unitName, it.contactName, it.phone, it.province, it.city,
+                                it.serverAddress, fmtTs(it.registeredAt), fmtTs(it.lastSeen),
+                                if (it.online) "在线" else "离线", it.appVersion)
+                        },
+                        jsonBody = devices
+                    )
+                }
+                get("/export/tasks") {
+                    val (from, to) = call.rangeParam()
+                    val tasks = Db.tasksByRange(from, to, call.tenantId())
+                    call.respondExport(
+                        filename = "tasks",
+                        headers = listOf("任务ID", "零件名称", "工艺方案ID", "状态", "耗时(秒)", "操作员", "开始时间", "结束时间"),
+                        rows = tasks.map {
+                            listOf(it.id, it.partName, it.planId, it.status, it.durationSec, it.operator,
+                                fmtTs(it.startedAt), fmtTs(it.finishedAt))
+                        },
+                        jsonBody = tasks
+                    )
+                }
+                get("/export/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val (from, to) = call.rangeParam()
+                    val logs = Db.logsByRange(deviceId, from, to, call.tenantId())
+                    call.respondExport(
+                        filename = "logs",
+                        headers = listOf("时间", "设备ID", "级别", "分类", "消息", "任务ID", "详情"),
+                        rows = logs.map {
+                            listOf(fmtTs(it.timestamp), it.deviceId ?: "", it.level, it.category, it.message,
+                                it.taskId ?: "", it.details ?: "")
+                        },
+                        jsonBody = logs
+                    )
+                }
+                delete("/data/tasks") {
+                    val (from, to) = call.rangeParam()
+                    if (from == null && to == null) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "请指定时间范围（from/to）"))
+                        return@delete
+                    }
+                    val deleted = Db.deleteTasksByRange(from, to, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已删除 $deleted 条任务记录"))
+                }
+                delete("/data/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val (from, to) = call.rangeParam()
+                    if (from == null && to == null) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "请指定时间范围（from/to）"))
+                        return@delete
+                    }
+                    val deleted = Db.deleteLogsByRange(deviceId, from, to, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已删除 $deleted 条日志"))
                 }
 
                 // ===== 客户端实时状态 =====
@@ -319,14 +788,39 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 post("/status") {
                     val status = call.receive<DeviceStatus>()
-                    Db.saveStatus(status)
+                    Db.saveStatus(status, call.tenantId())
                     StatusHub.broadcast(json.encodeToString(DeviceStatus.serializer(), status))
                     call.respond(SimpleResult(ok = true, message = "status accepted"))
                 }
 
                 // ===== 设备管理（后台）=====
+                // 注意：必须注册在 /devices/{id} 之前，避免 org-summary 被当作设备 id
+                get("/devices/org-summary") {
+                    call.respond(Db.orgSummary(call.tenantId()))
+                }
                 get("/devices") {
-                    call.respond(Db.listDevices())
+                    call.respond(Db.listDevices(call.tenantId()))
+                }
+                // 设备详情：R2 修复——需鉴权；设备令牌仅可查自身；响应剥离 token
+                //（token 仅在注册/心跳响应中下发，避免经此接口泄露）
+                get("/devices/{id}") {
+                    val id = call.parameters["id"].orEmpty()
+                    val token = call.bearerToken()
+                    val isAdmin = token == adminToken || Db.getSessionUser(token) != null
+                    if (!isAdmin) {
+                        val ownerId = Db.deviceIdByToken(token)
+                        if (ownerId == null) {
+                            call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                            return@get
+                        }
+                        if (ownerId != id) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "设备令牌仅可查询本机信息"))
+                            return@get
+                        }
+                    }
+                    val info = Db.getDevice(id, call.tenantId())
+                    if (info != null) call.respond(info.copy(token = ""))
+                    else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
                 }
                 put("/devices/{id}") {
                     val id = call.parameters["id"].orEmpty()
@@ -335,18 +829,18 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "单位、联系人、电话不能为空"))
                         return@put
                     }
-                    val ok = Db.updateDeviceInfo(id, body)
+                    val ok = Db.updateDeviceInfo(id, body, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "设备信息已更新" else "设备不存在"))
                 }
                 delete("/devices/{id}") {
                     val id = call.parameters["id"].orEmpty()
-                    val ok = Db.deleteDevice(id)
+                    val ok = Db.deleteDevice(id, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "设备已注销，可重新注册" else "设备不存在"))
                 }
                 put("/devices/{id}/permissions") {
                     val id = call.parameters["id"].orEmpty()
                     val body = call.receive<DevicePermissionsUpdate>()
-                    val ok = Db.updateDevicePermissions(id, body.permissions)
+                    val ok = Db.updateDevicePermissions(id, body.permissions, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "权限已更新" else "设备不存在"))
                 }
 
@@ -405,13 +899,67 @@ fun Application.cncServerModule(adminToken: String) {
                     )
                     call.respond(SimpleResult(ok = true, message = "已发布 v$versionName（$versionCode），${savedBytes / 1024} KB"))
                 }
-                post("/admin-password") {
-                    val body = call.receive<AdminPasswordUpdate>()
-                    if (body.newPassword.isBlank()) {
-                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码不能为空"))
+                // ===== 一键发布最新构建：扫描构建目录，无需手动选择本地 APK =====
+                get("/app-latest-candidate") {
+                    val c = ApkScanner().latest()
+                    if (c == null) {
+                        call.respond(ApkCandidateResult(found = false))
+                    } else {
+                        call.respond(
+                            ApkCandidateResult(
+                                found = true, path = c.path, fileName = c.fileName,
+                                versionCode = c.versionCode, versionName = c.versionName,
+                                sizeBytes = c.sizeBytes, modifiedAt = c.modifiedAt
+                            )
+                        )
+                    }
+                }
+                post("/app-publish-latest") {
+                    val body = runCatching { call.receive<PublishLatestRequest>() }
+                        .getOrDefault(PublishLatestRequest())
+                    val c = ApkScanner().latest()
+                    if (c == null) {
+                        call.respond(
+                            HttpStatusCode.NotFound,
+                            SimpleResult(ok = false, message = "未找到可用 APK 构建产物（请先用 gradlew assembleRelease/assembleDebug 构建，或设置 CNC_APK_DIR）")
+                        )
                         return@post
                     }
-                    if (body.newUsername.isNotBlank()) Db.setAdminUsername(body.newUsername.trim())
+                    val target = apkFile()
+                    target.parentFile?.mkdirs()
+                    File(c.path).copyTo(target, overwrite = true)
+                    Db.publishAppVersion(
+                        AppVersionInfo(
+                            versionCode = c.versionCode,
+                            versionName = c.versionName,
+                            changelog = body.changelog,
+                            sha256 = sha256Of(target),
+                            sizeBytes = c.sizeBytes,
+                            publishedAt = System.currentTimeMillis()
+                        )
+                    )
+                    call.respond(
+                        SimpleResult(
+                            ok = true,
+                            message = "已发布最新构建 v${c.versionName}（${c.versionCode}），${c.sizeBytes / 1024} KB，来自 ${c.fileName}"
+                        )
+                    )
+                }
+                post("/admin-password") {
+                    val body = call.receive<AdminPasswordUpdate>()
+                    if (body.newPassword.length < 6) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
+                        return@post
+                    }
+                    // 旧接口兼容：同步更新种子超管账号，避免 users 表仍保留旧口令
+                    val oldUsername = Db.adminUsername()
+                    val newUsername = body.newUsername.trim().ifBlank { oldUsername }
+                    val sync = runCatching { Db.syncLegacyAdminAccount(oldUsername, newUsername, body.newPassword) }
+                    if (sync.isFailure) {
+                        call.respond(HttpStatusCode.Conflict, SimpleResult(ok = false, message = "用户名已存在"))
+                        return@post
+                    }
+                    Db.setAdminUsername(newUsername)
                     Db.setAdminPassword(body.newPassword)
                     call.respond(SimpleResult(ok = true, message = "管理员账号密码已更新"))
                 }

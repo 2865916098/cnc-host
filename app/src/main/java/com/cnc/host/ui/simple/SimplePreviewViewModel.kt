@@ -34,6 +34,8 @@ data class SimplePreviewUiState(
     val toolpath: Toolpath? = null,
     val gcode: GcodeProgram? = null,
     val warnings: List<String> = emptyList(),
+    /** 验证器未执行的校验项（如毛坯碰撞），向操作员明示，不影响 ready。 */
+    val unverifiedChecks: List<String> = emptyList(),
     val ready: Boolean = false,
     val confirmClamp: Boolean = false,
     val started: Boolean = false,
@@ -124,6 +126,7 @@ class SimplePreviewViewModel(application: Application) : AndroidViewModel(applic
                 toolpath = toolpath,
                 gcode = gcode,
                 warnings = toolpath.validation.messages,
+                unverifiedChecks = toolpath.validation.unverifiedChecks,
                 ready = ready,
                 confirmClamp = _ui.value.confirmClamp,
                 started = SimpleRunController.state.value.running

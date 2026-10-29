@@ -17,7 +17,11 @@ data class CommConfig(
     val serialPort: String = "/dev/ttyUSB0",
     val baudRate: Int = 115200,
     val deviceId: Int = 1,
-    val timeoutMs: Long = 2000
+    val timeoutMs: Long = 2000,
+    /** 驱动类型：SIMULATOR（默认，内置模拟器）/ MODBUS_TCP（通用网口控制卡）等，由客户端驱动注册表解析。 */
+    val driverType: String = "SIMULATOR",
+    /** 驱动扩展参数（寄存器映射等），键值均由后台维护，客户端原样透传给驱动。 */
+    val params: Map<String, String> = emptyMap()
 )
 
 @Serializable
@@ -136,17 +140,84 @@ data class DrawingCorrectionConfig(
     val unit: String = "MM"
 )
 
+// ===================== 任务状态机（P2-③ / R8）=====================
+
+/**
+ * 任务生命周期状态（ADR-0003 配套，机床行业惯例）：
+ * PENDING_REVIEW(待审) → READY(就绪) → RUNNING(执行中) → SUCCESS(完成)/FAILED(失败)/ABORTED(中止)
+ *
+ * - 终态：SUCCESS / FAILED / ABORTED，一旦进入不可回退
+ * - 配置实体（刀具/材料/零件/毛坯/工艺/图纸）变更时，依赖其的非终态任务被重置为 PENDING_REVIEW
+ */
+const val TASK_STATE_PENDING_REVIEW = "PENDING_REVIEW"
+const val TASK_STATE_READY = "READY"
+const val TASK_STATE_RUNNING = "RUNNING"
+const val TASK_STATE_SUCCESS = "SUCCESS"
+const val TASK_STATE_FAILED = "FAILED"
+const val TASK_STATE_ABORTED = "ABORTED"
+
+/** 全部合法状态。 */
+val TASK_STATES: Set<String> = setOf(
+    TASK_STATE_PENDING_REVIEW, TASK_STATE_READY, TASK_STATE_RUNNING,
+    TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED
+)
+
+/** 终态集合：进入后不再受 revision 失效链影响，也不允许状态迁移。 */
+val TASK_TERMINAL_STATES: Set<String> = setOf(TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED)
+
+/** 合法状态迁移表（不含同态幂等，同态单独放行）。 */
+val TASK_STATE_TRANSITIONS: Map<String, Set<String>> = mapOf(
+    TASK_STATE_PENDING_REVIEW to setOf(TASK_STATE_READY, TASK_STATE_RUNNING),
+    TASK_STATE_READY to setOf(TASK_STATE_RUNNING, TASK_STATE_PENDING_REVIEW),
+    TASK_STATE_RUNNING to setOf(TASK_STATE_SUCCESS, TASK_STATE_FAILED, TASK_STATE_ABORTED),
+    TASK_STATE_SUCCESS to emptySet(),
+    TASK_STATE_FAILED to emptySet(),
+    TASK_STATE_ABORTED to emptySet()
+)
+
+/** 状态是否合法。 */
+fun isValidTaskState(state: String): Boolean = state in TASK_STATES
+
+/**
+ * 状态迁移是否合法。
+ * - 同态（from == to）恒合法：支持客户端断线重传的幂等 upsert
+ * - 终态不允许迁移到任何其它状态
+ * - 其余按 TASK_STATE_TRANSITIONS 校验
+ */
+fun isValidTaskTransition(from: String, to: String): Boolean {
+    if (from == to) return true
+    if (from in TASK_TERMINAL_STATES) return false
+    return TASK_STATE_TRANSITIONS[from]?.contains(to) == true
+}
+
+/** 中文状态标签（管理后台/导出用）。 */
+fun taskStateLabel(state: String): String = when (state) {
+    TASK_STATE_PENDING_REVIEW -> "待审"
+    TASK_STATE_READY -> "就绪"
+    TASK_STATE_RUNNING -> "执行中"
+    TASK_STATE_SUCCESS -> "完成"
+    TASK_STATE_FAILED -> "失败"
+    TASK_STATE_ABORTED -> "中止"
+    else -> state
+}
+
 @Serializable
 data class TaskRecord(
     val id: String = "",
     val partName: String = "",
     val planId: String = "",
+    /** 兼容字段：旧版客户端/历史记录仅写 status，服务端读取时回填到 state。 */
     val status: String = "SUCCESS",
+    /** 生命周期状态（P2-③）。新客户端必填，旧客户端缺省时取 status。 */
+    val state: String = "SUCCESS",
     val durationSec: Double = 0.0,
     val operator: String = "",
     val startedAt: Long = 0L,
     val finishedAt: Long = 0L
-)
+) {
+    /** 实际生效状态：state 非空用 state，否则回退 status（兼容旧客户端）。 */
+    val effectiveState: String get() = state.takeIf { it.isNotBlank() } ?: status
+}
 
 /** 客户端上报的实时状态（服务端转发给管理后台 WebSocket）。 */
 @Serializable
@@ -208,15 +279,17 @@ data class ClientPermissions(
     val history: Boolean = true
 )
 
-/** 客户端注册请求。注册前无需管理口令。 */
+/** 客户端注册（设备激活）请求。激活前无需管理口令。 */
 @Serializable
 data class RegisterRequest(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    val province: String = "",
+    val city: String = "",
     val serverAddress: String = "",
     val deviceId: String = "",
-    /** 硬件唯一标识（Android ID），用于保证同一台设备只能注册一次。 */
+    /** 硬件唯一标识（Android ID），激活按此标识幂等。 */
     val hardwareId: String = "",
     /** 客户端版本号，如 1.1.0。 */
     val appVersion: String = ""
@@ -231,7 +304,9 @@ data class HeartbeatRequest(val appVersion: String = "")
 data class DeviceUpdateRequest(
     val unitName: String = "",
     val contactName: String = "",
-    val phone: String = ""
+    val phone: String = "",
+    val province: String = "",
+    val city: String = ""
 )
 
 /** 客户端版本发布信息（自动更新用）。 */
@@ -245,18 +320,38 @@ data class AppVersionInfo(
     val publishedAt: Long = 0L
 )
 
+/** 「最新构建」候选 APK（服务端扫描构建目录得到）。 */
+@Serializable
+data class ApkCandidateResult(
+    val found: Boolean = false,
+    val path: String = "",
+    val fileName: String = "",
+    val versionCode: Int = 0,
+    val versionName: String = "",
+    val sizeBytes: Long = 0L,
+    val modifiedAt: Long = 0L
+)
+
+/** 一键发布最新构建的请求体。 */
+@Serializable
+data class PublishLatestRequest(val changelog: String = "")
+
 /** 注册后返回给客户端的设备信息（含权限）。 */
 @Serializable
 data class DeviceInfo(
     val id: String = "",
     val unitName: String = "",
+    val province: String = "",
+    val city: String = "",
     val contactName: String = "",
     val phone: String = "",
     val serverAddress: String = "",
     val registeredAt: Long = 0L,
     val lastSeen: Long = 0L,
     val online: Boolean = false,
-    val permissions: ClientPermissions = ClientPermissions()
+    val permissions: ClientPermissions = ClientPermissions(),
+    /** 设备令牌：注册时签发，客户端据此访问配置/任务/状态接口（心跳响应也携带，老客户端自动补录）。 */
+    val token: String = ""
 )
 
 /** 后台返回的设备列表项（含在线状态与客户端版本号）。 */
@@ -264,6 +359,8 @@ data class DeviceInfo(
 data class DeviceListItem(
     val id: String = "",
     val unitName: String = "",
+    val province: String = "",
+    val city: String = "",
     val contactName: String = "",
     val phone: String = "",
     val serverAddress: String = "",
@@ -272,6 +369,17 @@ data class DeviceListItem(
     val online: Boolean = false,
     val appVersion: String = "",
     val permissions: ClientPermissions = ClientPermissions()
+)
+
+/** 按单位统计的终端数量（后台客户维护用）。 */
+@Serializable
+data class OrgSummaryItem(
+    val orgName: String,
+    val province: String = "",
+    val city: String = "",
+    val deviceCount: Int,
+    val onlineCount: Int,
+    val lastSeen: Long
 )
 
 /** 后台更新设备权限。 */
@@ -299,5 +407,110 @@ data class AdminLoginResult(
     val message: String = "",
     val token: String = "",
     val username: String = "",
-    val expiresAt: Long = 0L
+    val expiresAt: Long = 0L,
+    val role: String = "",
+    val permissions: List<String> = emptyList(),
+    val displayName: String = ""
 )
+
+// ===================== 后台用户账号与权限 =====================
+
+/**
+ * 用户角色（机床行业惯例五角色，ADR-0003）：
+ * - SUPER_ADMIN      超级管理员（系统所有者/实施方，不受权限列表限制）
+ * - ADMIN            管理员（厂长/车间管理员，全部业务模块）
+ * - PROCESS_ENGINEER 工艺员（刀具/材料/零件/工艺/图纸 读写）
+ * - OPERATOR         操作员（概览/本机设备/任务执行回传）
+ * - QUALITY          质检员（任务/日志 只读）
+ */
+const val ROLE_SUPER_ADMIN = "SUPER_ADMIN"
+const val ROLE_ADMIN = "ADMIN"
+const val ROLE_PROCESS_ENGINEER = "PROCESS_ENGINEER"
+const val ROLE_OPERATOR = "OPERATOR"
+const val ROLE_QUALITY = "QUALITY"
+
+/** 全部可授权模块 key（前后端统一）。 */
+val ALL_MODULE_PERMISSIONS: List<String> = listOf(
+    "overview", "device", "tools", "materials", "parts", "plans",
+    "drawings", "devices", "tasks", "users", "app", "logs"
+)
+
+/** 各角色默认模块权限（创建用户未显式指定 permissions 时使用）。 */
+fun defaultPermissionsForRole(role: String): List<String> = when (role) {
+    ROLE_SUPER_ADMIN -> emptyList()          // 超管绕过权限列表
+    ROLE_ADMIN -> ALL_MODULE_PERMISSIONS
+    ROLE_PROCESS_ENGINEER -> listOf("overview", "tools", "materials", "parts", "plans", "drawings")
+    ROLE_OPERATOR -> listOf("overview", "device", "tasks")
+    ROLE_QUALITY -> listOf("overview", "tasks", "logs")
+    else -> emptyList()
+}
+
+/** 只读角色：对这些模块仅放行 GET/HEAD，写操作一律拒绝。 */
+fun readOnlyModulesForRole(role: String): Set<String> = when (role) {
+    ROLE_QUALITY -> setOf("tasks", "logs")
+    else -> emptySet()
+}
+
+@Serializable
+data class UserDto(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val role: String,
+    val permissions: List<String> = emptyList(),
+    val enabled: Boolean,
+    val createdAt: Long,
+    val lastLoginAt: Long = 0
+)
+
+@Serializable
+data class CreateUserRequest(
+    val username: String,
+    val password: String,
+    val displayName: String = "",
+    val role: String = "OPERATOR",
+    val permissions: List<String> = emptyList()
+)
+
+@Serializable
+data class UpdateUserRequest(
+    val displayName: String? = null,
+    val role: String? = null,
+    val permissions: List<String>? = null,
+    val enabled: Boolean? = null
+)
+
+@Serializable
+data class ResetPasswordRequest(val newPassword: String)
+
+@Serializable
+data class ChangePasswordRequest(val oldPassword: String, val newPassword: String)
+
+@Serializable
+data class SessionUserDto(
+    val id: String,
+    val username: String,
+    val displayName: String,
+    val role: String,
+    val permissions: List<String>,
+    val superAdmin: Boolean
+)
+
+// ===================== 操作日志 =====================
+
+/** 设备上传 / 管理端查询的单条操作日志。 */
+@Serializable
+data class OperationLogDto(
+    val timestamp: Long,
+    val level: String,
+    val category: String,
+    val message: String,
+    val taskId: String? = null,
+    val details: String? = null,
+    /** 设备 id：仅服务端导出/查询时填充，客户端上送时留空。 */
+    val deviceId: String? = null
+)
+
+/** 设备批量上传日志的请求体。 */
+@Serializable
+data class UploadLogsRequest(val deviceId: String, val logs: List<OperationLogDto>)

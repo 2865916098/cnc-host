@@ -95,6 +95,10 @@ private fun ReviewContent(ui: ReviewUiState, vm: ReviewViewModel) {
             tp.validation.messages.takeIf { it.isNotEmpty() }?.forEach {
                 Text("• $it", style = CncTypography.bodySmall, color = Color(0xFFFFA500))
             }
+            // 验证器未执行的校验项（规范 §3.3：未实现必须明示，不得宣称通过）
+            ui.unverifiedChecks.forEach {
+                Text("• 未校验：$it", style = CncTypography.bodySmall, color = CncColors.TextSecondary)
+            }
 
             Spacer(Modifier.height(12.dp))
             Text("安全约束", style = CncTypography.titleSmall, color = CncColors.TextPrimary, fontWeight = FontWeight.Bold)

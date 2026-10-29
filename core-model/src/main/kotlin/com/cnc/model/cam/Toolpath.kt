@@ -10,15 +10,26 @@ enum class MotionType {
     ARC_FEED
 }
 
-/** 校验结果。 */
+/**
+ * 校验结果（独立验证器输出，规范 §3.3）。
+ *
+ * 字段语义必须诚实：未实现的校验项不得宣称通过，必须在 [unverifiedChecks] 中明示。
+ */
 data class ToolpathValidation(
+    /** X/Z 坐标均未超设备行程（真实行程校验）。 */
     val withinTravel: Boolean,
+    /** 无 NaN/无穷坐标。 */
     val noIllegalCoordinates: Boolean,
+    /** 相邻段首尾连续，无异常跳变。 */
     val noAbnormalJumps: Boolean,
-    val noOvercut: Boolean,
+    /** 主轴转速未超设备上限（原名 noOvercut，名不符实已更正；几何过切校验见 [unverifiedChecks]）。 */
+    val spindleWithinLimit: Boolean,
+    /** 毛坯碰撞校验通过。该校验未实现时恒 false，并在 [unverifiedChecks] 明示。 */
     val noStockCollision: Boolean,
     val hasApproachRetract: Boolean,
-    val messages: List<String>
+    val messages: List<String>,
+    /** 未执行的校验项清单（如碰撞/过切），供 UI 向操作员明示，不参与通过判定。 */
+    val unverifiedChecks: List<String> = emptyList()
 )
 
 /**

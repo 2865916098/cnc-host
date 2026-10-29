@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
+import com.cnc.host.logging.LogRecorder
 import com.cnc.host.setup.SetupPrefs
 import com.cnc.host.sync.AppVersionDto
 import com.cnc.host.sync.ServerApi
@@ -44,6 +45,16 @@ object AppUpdate {
     /** 本次运行内用户点过「暂不」的 versionCode，不再重复弹窗。 */
     @Volatile
     private var dismissedCode: Int = 0
+
+    /**
+     * 发布签名证书 SHA-256 指纹白名单（ADR-0005）。
+     * 超级管理员分发正式签名密钥后，将证书指纹填入此列表并重新构建客户端；
+     * 为空时回退校验「与当前已安装应用同签名」。
+     */
+    internal var allowedReleaseCertSha256: Set<String> = emptySet()
+
+    /** 签名读取器工厂（单测可注入假实现）。 */
+    internal var signatureReaderFactory: (Context) -> ApkSignatureReader = { AndroidApkSignatureReader(it) }
 
     private var lastCheckAt: Long = 0L
     private const val CHECK_INTERVAL_MS = 60_000L
@@ -90,13 +101,16 @@ object AppUpdate {
         val target = File(context.cacheDir, "apk/cnc-host-update.apk")
         _prompt.value = null
         _progress.value = 0
+        LogRecorder.info(context, "SYSTEM", "开始下载更新 ${version.versionName}(${version.versionCode})")
         val result = ServerApi(settings).downloadApk(target) { downloaded, total ->
             _progress.value = if (total > 0) ((downloaded * 100) / total).toInt().coerceIn(0, 100) else 0
         }
         if (result.isFailure) {
             _progress.value = -1
             _prompt.value = version
-            return "下载失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+            val msg = "下载失败：${result.exceptionOrNull()?.message ?: "网络错误"}"
+            LogRecorder.error(context, "SYSTEM", msg, details = result.exceptionOrNull()?.stackTraceToString())
+            return msg
         }
         // 校验完整性
         if (version.sha256.isNotBlank()) {
@@ -105,9 +119,25 @@ object AppUpdate {
                 target.delete()
                 _progress.value = -1
                 _prompt.value = version
+                LogRecorder.error(context, "SYSTEM", "安装包 SHA-256 校验失败：期望 ${version.sha256.take(16)}...，实际 ${actual.take(16)}...")
                 return "安装包校验失败，请重试"
             }
         }
+        // 签名校验（ADR-0005）：SHA-256 只防传输损坏，签名校验防恶意替换；失败删包拒绝安装
+        val sigReader = signatureReaderFactory(context)
+        val sigError = ApkSignaturePolicy.verify(
+            apkCerts = sigReader.certSha256Of(target),
+            allowedReleaseCerts = allowedReleaseCertSha256,
+            currentAppCert = sigReader.currentAppCertSha256()
+        )
+        if (sigError != null) {
+            target.delete()
+            _progress.value = -1
+            _prompt.value = version
+            LogRecorder.error(context, "SYSTEM", "安装包签名校验失败：$sigError")
+            return sigError
+        }
+        LogRecorder.info(context, "SYSTEM", "更新下载完成，开始安装 ${version.versionName}(${version.versionCode})")
         _progress.value = -1
         install(context, target)
         return null

@@ -14,7 +14,11 @@ data class CommConfigDto(
     val serialPort: String = "/dev/ttyUSB0",
     val baudRate: Int = 115200,
     val deviceId: Int = 1,
-    val timeoutMs: Long = 2000
+    val timeoutMs: Long = 2000,
+    /** 驱动类型（SIMULATOR / MODBUS_TCP 等），由客户端驱动注册表解析。 */
+    val driverType: String = "SIMULATOR",
+    /** 驱动扩展参数（寄存器映射等），原样透传给驱动。 */
+    val params: Map<String, String> = emptyMap()
 )
 
 data class DeviceConfigDto(
@@ -137,6 +141,8 @@ data class TaskDto(
     val partName: String = "",
     val planId: String = "",
     val status: String = "SUCCESS",
+    /** 生命周期状态（P2-③）：PENDING_REVIEW / READY / RUNNING / SUCCESS / FAILED / ABORTED */
+    val state: String = "SUCCESS",
     val durationSec: Double = 0.0,
     val operator: String = "",
     val startedAt: Long = 0L,
@@ -159,6 +165,9 @@ data class StatusDto(
 
 data class SimpleOkDto(val ok: Boolean = false, val message: String = "", val id: String = "")
 
+/** 配置版本号（/config/version 轻量探测）。 */
+data class ConfigVersionDto(val version: Long = 0L)
+
 // ===================== 设备注册与权限 =====================
 
 data class ClientPermissionsDto(
@@ -179,9 +188,13 @@ data class RegisterRequestDto(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    /** 设备归属省份（如「广东省」），后台按地区统计终端数量。 */
+    val province: String = "",
+    /** 设备归属城市（如「深圳市」）。 */
+    val city: String = "",
     val serverAddress: String = "",
     val deviceId: String = "",
-    /** 硬件唯一标识（Android ID）：同一台设备只允许注册一次。 */
+    /** 硬件唯一标识（Android ID）：同一台设备只做一次激活登记，重复激活沿用原记录。 */
     val hardwareId: String = "",
     /** 当前客户端版本号，后台可见。 */
     val appVersion: String = ""
@@ -205,11 +218,32 @@ data class DeviceInfoDto(
     val unitName: String = "",
     val contactName: String = "",
     val phone: String = "",
+    /** 设备归属省份（旧服务端未返回时为空白，保持向后兼容）。 */
+    val province: String = "",
+    /** 设备归属城市（旧服务端未返回时为空白，保持向后兼容）。 */
+    val city: String = "",
     val serverAddress: String = "",
     val registeredAt: Long = 0L,
     val lastSeen: Long = 0L,
     val online: Boolean = false,
-    val permissions: ClientPermissionsDto = ClientPermissionsDto()
+    val permissions: ClientPermissionsDto = ClientPermissionsDto(),
+    /** 服务端签发的设备令牌：凭它访问配置/任务/状态接口。 */
+    val token: String = ""
 )
 
 data class AdminVerifyRequestDto(val password: String = "")
+
+// ===================== 操作日志 =====================
+
+/** 单条操作日志（客户端 ↔ 服务端）。 */
+data class OperationLogDto(
+    val timestamp: Long,
+    val level: String,
+    val category: String,
+    val message: String,
+    val taskId: String? = null,
+    val details: String? = null
+)
+
+/** 批量上传日志的请求体。 */
+data class UploadLogsRequestDto(val deviceId: String, val logs: List<OperationLogDto>)
