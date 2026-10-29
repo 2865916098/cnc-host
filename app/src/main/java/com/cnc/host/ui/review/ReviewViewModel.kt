@@ -72,6 +72,7 @@ class ReviewViewModel(
                 toolpath = tp,
                 gcode = result.gcode,
                 messages = tp.validation.messages,
+                unverifiedChecks = tp.validation.unverifiedChecks,
                 ready = tp.validation.messages.isEmpty() && tp.validation.noIllegalCoordinates,
                 machineFamily = result.selectedMachine,
                 sourceLabel = result.sourceLabel,
@@ -102,6 +103,7 @@ class ReviewViewModel(
                 toolpath = tp,
                 gcode = gcode,
                 messages = tp.validation.messages,
+                unverifiedChecks = tp.validation.unverifiedChecks,
                 ready = tp.validation.messages.isEmpty() && tp.validation.noIllegalCoordinates,
                 machineFamily = MachineFamily.FANUC_0I,
                 deviceConnected = device.isConnected(),
@@ -224,6 +226,8 @@ data class ReviewUiState(
     val toolpath: Toolpath? = null,
     val gcode: com.cnc.gcode.post.GcodeProgram? = null,
     val messages: List<String> = emptyList(),
+    /** 验证器未执行的校验项（如毛坯碰撞），向操作员明示，不影响 ready。 */
+    val unverifiedChecks: List<String> = emptyList(),
     val ready: Boolean = false,
     val machineFamily: MachineFamily = MachineFamily.FANUC_0I,
     /** 刀路来源（图纸文件名 / 内置示例），便于确认审的是哪份程序。 */

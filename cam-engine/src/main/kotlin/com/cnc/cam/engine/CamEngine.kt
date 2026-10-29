@@ -70,7 +70,9 @@ object CamEngine {
         }
 
         val validation = validate(segments, contour, step)
-        val valid = validation.noIllegalCoordinates && validation.noAbnormalJumps
+        // 独立否决权（规范 §3.3）：非法坐标 / 超行程 / 段间跳变 / 转速超限，任一失败即不可执行
+        val valid = validation.noIllegalCoordinates && validation.withinTravel &&
+            validation.noAbnormalJumps && validation.spindleWithinLimit
 
         return Toolpath(
             id = "tp-${step.type.name.lowercase()}-${contour.id}",
@@ -362,13 +364,25 @@ object CamEngine {
 
     // ============== 校验 ==============
 
-    /** 校验刀路合法性。 */
+    /**
+     * 独立验证器（规范 §3.3）：校验刀路合法性。
+     *
+     * 已实现的校验（失败即拒绝，[Toolpath.valid] = false）：
+     * - 非法坐标（NaN/无穷）
+     * - 行程越界（|X| ≤ [maxTravelX]，|Z| ≤ [maxTravelZ]，由设备配置提供）
+     * - 段间连续性（相邻段首尾必须重合）
+     * - 主轴转速上限（≤ [maxSpindleRpm]）
+     *
+     * 未实现的校验（不得宣称通过）：毛坯碰撞、几何过切——
+     * 在 [ToolpathValidation.unverifiedChecks] 中明示，由操作员知悉。
+     */
     fun validate(
         segments: List<ToolpathSegment>,
         contour: MachiningContour,
         step: ProcessStep,
         maxTravelX: Double = 500.0,
-        maxTravelZ: Double = 500.0
+        maxTravelZ: Double = 500.0,
+        maxSpindleRpm: Int = 10000
     ): ToolpathValidation {
         val messages = mutableListOf<String>()
 
@@ -377,21 +391,27 @@ object CamEngine {
             messages.add("刀路为空")
         }
 
-        // 2. 非法坐标
+        // 2. 非法坐标（NaN/无穷）——与行程校验分离
         var noIllegal = true
         for (seg in segments) {
-            if (seg.start.x.isNaN() || seg.start.y.isNaN() || seg.end.x.isNaN() || seg.end.y.isNaN()) {
-                noIllegal = false; messages.add("段 ${seg.segmentId} 包含 NaN 坐标")
-            }
-            if (abs(seg.start.x) > maxTravelX || abs(seg.end.x) > maxTravelX) {
-                noIllegal = false; messages.add("段 ${seg.segmentId} X 轴超出行程 $maxTravelX")
-            }
-            if (abs(seg.start.y) > maxTravelZ || abs(seg.end.y) > maxTravelZ) {
-                noIllegal = false; messages.add("段 ${seg.segmentId} Z 轴超出行程 $maxTravelZ")
+            val coords = listOf(seg.start.x, seg.start.y, seg.end.x, seg.end.y)
+            if (coords.any { it.isNaN() || it.isInfinite() }) {
+                noIllegal = false; messages.add("段 ${seg.segmentId} 包含非法坐标（NaN/无穷）")
             }
         }
 
-        // 3. 异常跳跃（RAPID 之后立即一个很大的 FEED 跳跃，说明快进没到位）
+        // 3. 行程校验（真实设备行程上限；NaN/无穷段已由第 2 步标记，此处跳过比较）
+        var withinTravel = true
+        for (seg in segments) {
+            if (listOf(seg.start.x, seg.end.x).any { it.isFinite() && abs(it) > maxTravelX }) {
+                withinTravel = false; messages.add("段 ${seg.segmentId} X 轴超出行程 ±$maxTravelX mm")
+            }
+            if (listOf(seg.start.y, seg.end.y).any { it.isFinite() && abs(it) > maxTravelZ }) {
+                withinTravel = false; messages.add("段 ${seg.segmentId} Z 轴超出行程 ±$maxTravelZ mm")
+            }
+        }
+
+        // 4. 异常跳跃（RAPID 之后立即一个很大的 FEED 跳跃，说明快进没到位）
         var noAbnormalJumps = true
         for (i in 1 until segments.size) {
             val prev = segments[i - 1]
@@ -403,22 +423,23 @@ object CamEngine {
             }
         }
 
-        // 4. 主轴转速校验
-        var noOvercut = true
-        val maxRpm = 10000
-        if (segments.any { it.spindleRpm > maxRpm }) {
-            noOvercut = false
-            messages.add("主轴转速超过上限 $maxRpm")
+        // 5. 主轴转速上限校验
+        var spindleWithinLimit = true
+        val overRpm = segments.filter { it.spindleRpm > maxSpindleRpm }
+        if (overRpm.isNotEmpty()) {
+            spindleWithinLimit = false
+            messages.add("主轴转速超过设备上限 $maxSpindleRpm rpm（${overRpm.first().segmentId} 等 ${overRpm.size} 段）")
         }
 
         return ToolpathValidation(
-            withinTravel = noIllegal,
+            withinTravel = withinTravel,
             noIllegalCoordinates = noIllegal,
             noAbnormalJumps = noAbnormalJumps,
-            noOvercut = noOvercut,
-            noStockCollision = true, // 后续补充
+            spindleWithinLimit = spindleWithinLimit,
+            noStockCollision = false, // 毛坯碰撞校验未实现：明示未通过，不得恒 true
             hasApproachRetract = segments.isNotEmpty(), // 简化
-            messages = messages
+            messages = messages,
+            unverifiedChecks = listOf("毛坯碰撞校验", "几何过切校验")
         )
     }
 

@@ -46,6 +46,16 @@ object AppUpdate {
     @Volatile
     private var dismissedCode: Int = 0
 
+    /**
+     * 发布签名证书 SHA-256 指纹白名单（ADR-0005）。
+     * 超级管理员分发正式签名密钥后，将证书指纹填入此列表并重新构建客户端；
+     * 为空时回退校验「与当前已安装应用同签名」。
+     */
+    internal var allowedReleaseCertSha256: Set<String> = emptySet()
+
+    /** 签名读取器工厂（单测可注入假实现）。 */
+    internal var signatureReaderFactory: (Context) -> ApkSignatureReader = { AndroidApkSignatureReader(it) }
+
     private var lastCheckAt: Long = 0L
     private const val CHECK_INTERVAL_MS = 60_000L
 
@@ -112,6 +122,20 @@ object AppUpdate {
                 LogRecorder.error(context, "SYSTEM", "安装包 SHA-256 校验失败：期望 ${version.sha256.take(16)}...，实际 ${actual.take(16)}...")
                 return "安装包校验失败，请重试"
             }
+        }
+        // 签名校验（ADR-0005）：SHA-256 只防传输损坏，签名校验防恶意替换；失败删包拒绝安装
+        val sigReader = signatureReaderFactory(context)
+        val sigError = ApkSignaturePolicy.verify(
+            apkCerts = sigReader.certSha256Of(target),
+            allowedReleaseCerts = allowedReleaseCertSha256,
+            currentAppCert = sigReader.currentAppCertSha256()
+        )
+        if (sigError != null) {
+            target.delete()
+            _progress.value = -1
+            _prompt.value = version
+            LogRecorder.error(context, "SYSTEM", "安装包签名校验失败：$sigError")
+            return sigError
         }
         LogRecorder.info(context, "SYSTEM", "更新下载完成，开始安装 ${version.versionName}(${version.versionCode})")
         _progress.value = -1

@@ -153,7 +153,67 @@ class CamEngineTest {
         val tp = CamEngine.generate(contour, step, 60.0, 50.0, "pp-1", 1)
         assertTrue(tp.valid)
         assertTrue(tp.validation.noIllegalCoordinates)
+        assertTrue(tp.validation.withinTravel)
+        assertTrue(tp.validation.spindleWithinLimit)
     }
+
+    // ==================== 独立验证器（规范 §3.3，R3 修复） ====================
+
+    @Test
+    fun `over-travel segment is rejected by validator`() {
+        // X 终点 600 超出默认行程上限 500 → withinTravel=false 且 valid=false（否决）
+        val seg = makeFeedSeg("over-x", Point2D(0.0, 0.0), Point2D(600.0, 10.0))
+        val v = CamEngine.validate(listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING))
+        assertFalse(v.withinTravel)
+        assertTrue(v.messages.any { it.contains("行程") })
+    }
+
+    @Test
+    fun `travel limits are configurable and tighter limit rejects normal toolpath`() {
+        // 正常刀路（X 最大约 80）在行程上限收紧到 50 时必须被拒绝
+        val contour = makeSimpleContour()
+        val step = makeStep(ProcessType.ROUGH_TURNING)
+        val tp = CamEngine.generate(contour, step, 60.0, 50.0, "pp-1", 1)
+        val v = CamEngine.validate(tp.segments, contour, step, maxTravelX = 50.0)
+        assertFalse(v.withinTravel)
+    }
+
+    @Test
+    fun `spindle rpm above device limit is rejected`() {
+        val seg = makeFeedSeg("over-rpm", Point2D(0.0, 0.0), Point2D(10.0, 10.0)).copy(spindleRpm = 12000)
+        val v = CamEngine.validate(listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING), maxSpindleRpm = 10000)
+        assertFalse(v.spindleWithinLimit)
+        assertTrue(v.messages.any { it.contains("转速") })
+    }
+
+    @Test
+    fun `NaN is illegal coordinate but not mixed into travel check`() {
+        // NaN 只归 noIllegalCoordinates，不参与行程比较（abs(NaN)>x 恒 false）
+        val seg = makeFeedSeg("nan", Point2D(Double.NaN, 0.0), Point2D(10.0, 10.0))
+        val v = CamEngine.validate(listOf(seg), makeSimpleContour(), makeStep(ProcessType.ROUGH_TURNING))
+        assertFalse(v.noIllegalCoordinates)
+        assertTrue(v.withinTravel)
+    }
+
+    @Test
+    fun `unimplemented checks are declared instead of claimed passed`() {
+        // 规范 §3.3：碰撞/过切未实现 → noStockCollision 不得为 true，且 unverifiedChecks 明示
+        val contour = makeSimpleContour()
+        val step = makeStep(ProcessType.ROUGH_TURNING)
+        val tp = CamEngine.generate(contour, step, 60.0, 50.0, "pp-1", 1)
+        assertFalse(tp.validation.noStockCollision)
+        assertTrue(tp.validation.unverifiedChecks.isNotEmpty())
+        // 未实现项不影响已实现校验的通过判定
+        assertTrue(tp.valid)
+    }
+
+    private fun makeFeedSeg(id: String, start: Point2D, end: Point2D) = com.cnc.model.cam.ToolpathSegment(
+        segmentId = id,
+        motionType = com.cnc.model.cam.MotionType.LINEAR_FEED,
+        start = start, end = end,
+        feedMmPerMin = 200.0, spindleRpm = 1000,
+        processType = ProcessType.ROUGH_TURNING, toolNumber = 1
+    )
 
     @Test
     fun `validation flags NaN coordinates`() {
