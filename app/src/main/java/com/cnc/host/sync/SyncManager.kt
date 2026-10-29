@@ -21,7 +21,9 @@ data class SyncState(
     val cachedVersion: Long = 0,
     val lastSyncAt: Long? = null,
     val lastError: String? = null,
-    val lastMessage: String = ""
+    val lastMessage: String = "",
+    /** 待补传任务数（P2-④ 弱网/离线提示）。 */
+    val pendingCount: Int = 0
 )
 
 data class SyncOutcome(val version: Long, val changed: Boolean)
@@ -50,7 +52,8 @@ object SyncManager {
             it.copy(
                 configured = settings.configured,
                 cachedVersion = version,
-                lastSyncAt = lastAt
+                lastSyncAt = lastAt,
+                pendingCount = pendingCount(context)
             )
         }
     }
@@ -120,7 +123,8 @@ object SyncManager {
                         syncing = false,
                         online = false,
                         lastError = message,
-                        lastMessage = "同步失败，继续使用本地缓存"
+                        lastMessage = "同步失败，继续使用本地缓存",
+                        pendingCount = pendingCount(context)
                     )
                 }
                 return Result.failure(Exception(message, remote.exceptionOrNull()))
@@ -164,7 +168,8 @@ object SyncManager {
                         changed -> "已同步到配置版本 v${config.version}"
                         flushed > 0 -> "配置无变化，已补传 $flushed 条任务"
                         else -> "配置已是最新版本 v${config.version}"
-                    }
+                    },
+                    pendingCount = pendingCount(context)
                 )
             }
             return Result.success(SyncOutcome(config.version, changed))
@@ -209,6 +214,8 @@ object SyncManager {
             } else {
                 flushPendingTasksLocked(context, api)
             }
+            // 刷新待补传计数（P2-④ 弱网/离线提示）
+            _state.update { it.copy(pendingCount = pendingCount(context)) }
         }
     }
 
