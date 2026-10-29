@@ -1,5 +1,6 @@
 package com.cnc.server
 
+import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.HttpHeaders
 import io.ktor.http.content.PartData
@@ -70,6 +71,46 @@ private fun ApplicationCall.bearerToken(): String =
 
 /** 租户上下文（ADR-0002）：取请求头 X-Tenant-Id，缺省回退默认租户。 */
 private fun ApplicationCall.tenantId(): String = Db.normalizeTenant(request.headers["X-Tenant-Id"])
+
+/** CSV 字段转义：含逗号/引号/换行时加双引号并转义内部引号。 */
+private fun csvCell(v: Any?): String {
+    val s = v?.toString() ?: ""
+    return if (s.contains('"') || s.contains(',') || s.contains('\n')) {
+        "\"" + s.replace("\"", "\"\"") + "\""
+    } else s
+}
+
+private fun csvLine(vararg cols: Any?): String = cols.joinToString(",") { csvCell(it) }
+
+/** 毫秒时间戳 → yyyy-MM-dd HH:mm:ss（本地时区）。 */
+private fun fmtTs(ms: Long): String =
+    if (ms <= 0L) "" else java.time.Instant.ofEpochMilli(ms)
+        .atZone(java.time.ZoneId.systemDefault())
+        .format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
+
+/** 统一导出响应：format=csv 下载文件，否则返回 JSON。 */
+private suspend fun ApplicationCall.respondExport(
+    filename: String,
+    headers: List<String>,
+    rows: List<List<Any?>>,
+    jsonBody: Any
+) {
+    val format = request.queryParameters["format"]?.lowercase()?.takeIf { it == "json" }
+    if (format == "json") {
+        respond(jsonBody)
+    } else {
+        val csv = buildString {
+            appendLine(headers.joinToString(",") { csvCell(it) })
+            rows.forEach { appendLine(it.joinToString(",") { c -> csvCell(c) }) }
+        }
+        response.header("Content-Disposition", "attachment; filename=\"$filename.csv\"")
+        respondText(csv, ContentType.parse("text/csv; charset=utf-8"))
+    }
+}
+
+/** 解析时间范围查询参数（毫秒时间戳，可空）。 */
+private fun ApplicationCall.rangeParam(): Pair<Long?, Long?> =
+    request.queryParameters["from"]?.toLongOrNull() to request.queryParameters["to"]?.toLongOrNull()
 
 /** 管理端操作者：环境变量口令 / 设备令牌视为超管虚拟账号。 */
 private data class AdminActor(
@@ -673,8 +714,72 @@ fun Application.cncServerModule(adminToken: String) {
                     val deviceId = call.request.queryParameters["deviceId"]
                     val olderThanMs = call.request.queryParameters["olderThanMs"]?.toLongOrNull()
                         ?: (System.currentTimeMillis() - 7L * 24 * 3600 * 1000)
-                    val deleted = Db.deleteLogsOlderThan(deviceId, olderThanMs, call.tenantId())
+                    val deleted = Db.deleteLogsByRange(deviceId, from = null, to = olderThanMs, call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "已清理 $deleted 条日志"))
+                }
+
+                // ===== 数据导出 / 按范围清理（租户隔离，from/to 为毫秒时间戳）=====
+                get("/export/devices") {
+                    val (from, to) = call.rangeParam()
+                    val devices = Db.listDevices(call.tenantId()).filter { d ->
+                        (from == null || d.registeredAt >= from) && (to == null || d.registeredAt <= to)
+                    }
+                    call.respondExport(
+                        filename = "devices",
+                        headers = listOf("设备ID", "单位名称", "联系人", "电话", "省份", "城市", "服务端地址", "注册时间", "最后在线", "在线状态", "App版本"),
+                        rows = devices.map {
+                            listOf(it.id, it.unitName, it.contactName, it.phone, it.province, it.city,
+                                it.serverAddress, fmtTs(it.registeredAt), fmtTs(it.lastSeen),
+                                if (it.online) "在线" else "离线", it.appVersion)
+                        },
+                        jsonBody = devices
+                    )
+                }
+                get("/export/tasks") {
+                    val (from, to) = call.rangeParam()
+                    val tasks = Db.tasksByRange(from, to, call.tenantId())
+                    call.respondExport(
+                        filename = "tasks",
+                        headers = listOf("任务ID", "零件名称", "工艺方案ID", "状态", "耗时(秒)", "操作员", "开始时间", "结束时间"),
+                        rows = tasks.map {
+                            listOf(it.id, it.partName, it.planId, it.status, it.durationSec, it.operator,
+                                fmtTs(it.startedAt), fmtTs(it.finishedAt))
+                        },
+                        jsonBody = tasks
+                    )
+                }
+                get("/export/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val (from, to) = call.rangeParam()
+                    val logs = Db.logsByRange(deviceId, from, to, call.tenantId())
+                    call.respondExport(
+                        filename = "logs",
+                        headers = listOf("时间", "设备ID", "级别", "分类", "消息", "任务ID", "详情"),
+                        rows = logs.map {
+                            listOf(fmtTs(it.timestamp), it.deviceId ?: "", it.level, it.category, it.message,
+                                it.taskId ?: "", it.details ?: "")
+                        },
+                        jsonBody = logs
+                    )
+                }
+                delete("/data/tasks") {
+                    val (from, to) = call.rangeParam()
+                    if (from == null && to == null) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "请指定时间范围（from/to）"))
+                        return@delete
+                    }
+                    val deleted = Db.deleteTasksByRange(from, to, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已删除 $deleted 条任务记录"))
+                }
+                delete("/data/logs") {
+                    val deviceId = call.request.queryParameters["deviceId"]
+                    val (from, to) = call.rangeParam()
+                    if (from == null && to == null) {
+                        call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "请指定时间范围（from/to）"))
+                        return@delete
+                    }
+                    val deleted = Db.deleteLogsByRange(deviceId, from, to, call.tenantId())
+                    call.respond(SimpleResult(ok = true, message = "已删除 $deleted 条日志"))
                 }
 
                 // ===== 客户端实时状态 =====

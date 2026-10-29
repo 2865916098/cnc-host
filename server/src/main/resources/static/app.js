@@ -204,6 +204,7 @@
     { id: "drawings", label: "图纸任务", sub: "DXF 原文与尺寸校正，客户端据此生成刀路", count: (c) => c.drawings.length },
     { id: "devices", label: "设备管理", sub: "已激活终端、在线状态与功能权限", count: () => S.devices.length },
     { id: "tasks", label: "任务记录", sub: "平板端回传的执行记录", count: () => S.tasks.length },
+    { id: "logs", label: "操作日志", sub: "设备上报的运行/报警日志", count: () => (S.logs || []).length },
     { id: "users", label: "用户管理", sub: "后台账号、角色与模块权限分配", count: () => S.users ? S.users.length : "" }
   ];
 
@@ -228,6 +229,7 @@
     render();
     if (id === "devices") startDevicesPolling(); else stopDevicesPolling();
     if (id === "users") loadUsers();
+    if (id === "logs") loadLogs();
   };
 
   // ===== 设备页自动刷新：激活/心跳与单位统计变化 3 秒内可见 =====
@@ -278,6 +280,7 @@
       drawings: viewDrawings,
       devices: viewDevices,
       tasks: viewTasks,
+      logs: viewLogs,
       users: viewUsers
     };
     const view = views[S.tab] || viewOverview;
@@ -790,10 +793,71 @@
   }
 
   function viewTasks() {
-    return `<div class="panel"><h3>任务记录</h3>
+    return `<div class="panel"><h3>任务记录 <button class="small" onclick="exportCsv('tasks')">导出 CSV</button> <button class="small danger" onclick="cleanByRange('tasks')">按时间清理</button></h3>
       <div class="desc">由平板端在任务结束后自动上传；离线期间暂存本机，联网后补传。</div>
       ${taskTable(S.tasks)}</div>`;
   }
+
+  // ===== 操作日志 =====
+  async function loadLogs() {
+    try {
+      S.logs = await api("/api/v1/logs").catch(() => []);
+    } catch (e) { S.logs = []; }
+    if (S.tab === "logs") render();
+  }
+
+  function viewLogs() {
+    const list = S.logs || [];
+    const rows = list.map((l) => `<tr>
+      <td class="muted">${fmtTime(l.timestamp)}</td>
+      <td>${esc(l.deviceId || "-")}</td>
+      <td>${esc(l.level)}</td>
+      <td>${esc(l.category)}</td>
+      <td>${esc(l.message)}</td>
+    </tr>`).join("");
+    return `<div class="panel"><h3>操作日志 <button class="small" onclick="exportCsv('logs')">导出 CSV</button> <button class="small danger" onclick="cleanByRange('logs')">按时间清理</button></h3>
+      ${table(["时间", "设备", "级别", "分类", "消息"], rows, "暂无日志")}</div>`;
+  }
+
+  /** 导出 CSV：带鉴权拉取后以 Blob 方式触发浏览器下载。 */
+  window.exportCsv = async function (type) {
+    try {
+      const res = await fetch(`/api/v1/export/${type}`, { headers: { Authorization: "Bearer " + S.token } });
+      if (!res.ok) throw new Error(res.status);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${type}-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      toast("导出失败", true);
+    }
+  };
+
+  /** 按时间范围清理数据（任务/日志），需二次确认。 */
+  window.cleanByRange = async function (type) {
+    const label = type === "tasks" ? "任务记录" : "操作日志";
+    const fromStr = prompt(`清理「${label}」\n起始时间（留空表示不限制），格式：YYYY-MM-DD\n例如 2026-01-01`);
+    if (fromStr === null) return;
+    const toStr = prompt(`结束时间（留空表示不限制），格式：YYYY-MM-DD\n例如 2026-12-31`);
+    if (toStr === null) return;
+    const from = fromStr ? new Date(fromStr + "T00:00:00").getTime() : null;
+    const to = toStr ? new Date(toStr + "T23:59:59").getTime() : null;
+    if ((fromStr && isNaN(from)) || (toStr && isNaN(to))) { toast("日期格式无效", true); return; }
+    if (from == null && to == null) { toast("请至少填写一个时间边界", true); return; }
+    if (!confirm(`确认删除该时间范围内的全部${label}？此操作不可撤销。`)) return;
+    const qs = new URLSearchParams();
+    if (from != null) qs.set("from", from);
+    if (to != null) qs.set("to", to);
+    const r = await api(`/api/v1/data/${type}?${qs.toString()}`, { method: "DELETE" });
+    toast(r.message || "已清理");
+    if (type === "tasks") { S.tasks = await api("/api/v1/tasks").catch(() => S.tasks); render(); }
+    else { await loadLogs(); }
+  };
 
   // ===== 设备管理 =====
   const PERM_LABELS = [
@@ -886,7 +950,7 @@
     return `
       <div class="hint-box">已激活终端列表。设备首次启动需激活并填写单位与地区，便于按单位统计终端数量。</div>
       ${orgSummaryHtml()}
-      <div class="panel"><h3>已激活终端</h3>${table}</div>
+      <div class="panel"><h3>已激活终端 <button class="small" onclick="exportCsv('devices')">导出 CSV</button></h3>${table}</div>
       <div class="panel"><h3>客户端版本发布（自动更新）</h3>
         <div class="desc" style="margin-bottom:10px">${verText}</div>
         ${candHtml}

@@ -892,6 +892,54 @@ object Db {
         }
     }
 
+    /** 按时间范围查询任务记录（用于导出/清理），from/to 为空表示不限制该端。 */
+    fun tasksByRange(from: Long?, to: Long?, tenantId: String = DEFAULT_TENANT): List<TaskRecord> = withConn { c ->
+        val sql = buildString {
+            append("SELECT * FROM task_history WHERE tenant_id = ?")
+            if (from != null) append(" AND startedAt >= ?")
+            if (to != null) append(" AND startedAt <= ?")
+            append(" ORDER BY startedAt DESC")
+        }
+        c.prepareStatement(sql).use { ps ->
+            var i = 1
+            ps.setString(i++, tenantId)
+            if (from != null) ps.setLong(i++, from)
+            if (to != null) ps.setLong(i++, to)
+            ps.executeQuery().use { rs ->
+                buildList {
+                    while (rs.next()) add(
+                        TaskRecord(
+                            id = rs.getString("id"),
+                            partName = rs.getString("partName"),
+                            planId = rs.getString("planId"),
+                            status = rs.getString("status"),
+                            durationSec = rs.getDouble("durationSec"),
+                            operator = rs.getString("operator"),
+                            startedAt = rs.getLong("startedAt"),
+                            finishedAt = rs.getLong("finishedAt")
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    /** 按时间范围删除任务记录，返回删除行数。 */
+    fun deleteTasksByRange(from: Long?, to: Long?, tenantId: String = DEFAULT_TENANT): Int = withConn { c ->
+        val sql = buildString {
+            append("DELETE FROM task_history WHERE tenant_id = ?")
+            if (from != null) append(" AND startedAt >= ?")
+            if (to != null) append(" AND startedAt <= ?")
+        }
+        c.prepareStatement(sql).use { ps ->
+            var i = 1
+            ps.setString(i++, tenantId)
+            if (from != null) ps.setLong(i++, from)
+            if (to != null) ps.setLong(i++, to)
+            ps.executeUpdate()
+        }
+    }
+
     fun upsertTask(task: TaskRecord, tenantId: String = DEFAULT_TENANT): TaskRecord = withConn { c ->
         val id = task.id.ifBlank { "task-${UUID.randomUUID().toString().take(8)}" }
         val saved = task.copy(id = id)
@@ -1949,9 +1997,9 @@ object Db {
     /** 查询操作日志；可选按 deviceId 过滤，按 timestamp DESC 返回。 */
     fun listLogs(deviceId: String? = null, limit: Int = 500, tenantId: String = DEFAULT_TENANT): List<OperationLogDto> = withConn { c ->
         val sql = if (deviceId.isNullOrBlank()) {
-            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?"
+            "SELECT device_id, timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?"
         } else {
-            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT ?"
+            "SELECT device_id, timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT ?"
         }
         c.prepareStatement(sql).use { ps ->
             ps.setString(1, tenantId)
@@ -1967,7 +2015,8 @@ object Db {
                                 category = rs.getString("category"),
                                 message = rs.getString("message"),
                                 taskId = rs.getString("task_id"),
-                                details = rs.getString("details")
+                                details = rs.getString("details"),
+                                deviceId = rs.getString("device_id")
                             )
                         )
                     }
@@ -1976,17 +2025,55 @@ object Db {
         }
     }
 
-    /** 清理指定设备（或全部）早于 olderThanMs 的日志，返回删除行数。 */
-    fun deleteLogsOlderThan(deviceId: String?, olderThanMs: Long, tenantId: String = DEFAULT_TENANT): Int = withConn { c ->
-        val sql = if (deviceId.isNullOrBlank()) {
-            "DELETE FROM operation_logs WHERE tenant_id = ? AND timestamp < ?"
-        } else {
-            "DELETE FROM operation_logs WHERE tenant_id = ? AND device_id = ? AND timestamp < ?"
+    /** 按时间范围查询操作日志（用于导出/清理），from/to 为空表示不限制该端。 */
+    fun logsByRange(deviceId: String?, from: Long?, to: Long?, tenantId: String = DEFAULT_TENANT): List<OperationLogDto> = withConn { c ->
+        val sql = buildString {
+            append("SELECT device_id, timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ?")
+            if (!deviceId.isNullOrBlank()) append(" AND device_id = ?")
+            if (from != null) append(" AND timestamp >= ?")
+            if (to != null) append(" AND timestamp <= ?")
+            append(" ORDER BY timestamp DESC")
         }
         c.prepareStatement(sql).use { ps ->
-            ps.setString(1, tenantId)
-            if (!deviceId.isNullOrBlank()) ps.setString(2, deviceId)
-            ps.setLong(if (deviceId.isNullOrBlank()) 2 else 3, olderThanMs)
+            var i = 1
+            ps.setString(i++, tenantId)
+            if (!deviceId.isNullOrBlank()) ps.setString(i++, deviceId)
+            if (from != null) ps.setLong(i++, from)
+            if (to != null) ps.setLong(i++, to)
+            ps.executeQuery().use { rs ->
+                buildList {
+                    while (rs.next()) {
+                        add(
+                            OperationLogDto(
+                                timestamp = rs.getLong("timestamp"),
+                                level = rs.getString("level"),
+                                category = rs.getString("category"),
+                                message = rs.getString("message"),
+                                taskId = rs.getString("task_id"),
+                                details = rs.getString("details"),
+                                deviceId = rs.getString("device_id")
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /** 按时间范围删除操作日志，返回删除行数。 */
+    fun deleteLogsByRange(deviceId: String?, from: Long?, to: Long?, tenantId: String = DEFAULT_TENANT): Int = withConn { c ->
+        val sql = buildString {
+            append("DELETE FROM operation_logs WHERE tenant_id = ?")
+            if (!deviceId.isNullOrBlank()) append(" AND device_id = ?")
+            if (from != null) append(" AND timestamp >= ?")
+            if (to != null) append(" AND timestamp <= ?")
+        }
+        c.prepareStatement(sql).use { ps ->
+            var i = 1
+            ps.setString(i++, tenantId)
+            if (!deviceId.isNullOrBlank()) ps.setString(i++, deviceId)
+            if (from != null) ps.setLong(i++, from)
+            if (to != null) ps.setLong(i++, to)
             ps.executeUpdate()
         }
     }

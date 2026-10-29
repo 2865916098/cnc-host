@@ -439,7 +439,9 @@ data class OperationLogDto(
     val category: String,
     val message: String,
     val taskId: String? = null,
-    val details: String? = null
+    val details: String? = null,
+    /** 设备 id：仅服务端导出/查询时填充，客户端上送时留空。 */
+    val deviceId: String? = null
 )
 
 /** 设备批量上传日志的请求体。 */
