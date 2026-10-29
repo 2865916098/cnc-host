@@ -20,7 +20,9 @@ data class SessionUser(
     val displayName: String,
     val role: String,
     val permissions: List<String>,
-    val enabled: Boolean
+    val enabled: Boolean,
+    /** 会话所属租户（ADR-0002），路由层据此校验请求头租户上下文。 */
+    val tenantId: String = Db.DEFAULT_TENANT
 )
 
 /**
@@ -30,6 +32,13 @@ data class SessionUser(
  * 所有配置写操作都会递增 config_version，客户端据此做增量同步判断。
  */
 object Db {
+
+    /** 多租户：私有化部署恒为该租户（ADR-0002）。 */
+    const val DEFAULT_TENANT = "default"
+
+    /** 解析租户上下文：null/空白回退默认租户。 */
+    fun normalizeTenant(raw: String?): String =
+        raw?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_TENANT
 
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     private lateinit var url: String
@@ -61,6 +70,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS tools(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         toolNumber INTEGER NOT NULL,
                         toolType TEXT NOT NULL,
                         name TEXT NOT NULL,
@@ -79,6 +89,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS materials(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         name TEXT NOT NULL,
                         code TEXT NOT NULL,
                         density REAL NOT NULL,
@@ -95,6 +106,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS parts(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         name TEXT NOT NULL,
                         materialId TEXT NOT NULL,
                         notes TEXT NOT NULL
@@ -105,6 +117,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS blanks(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         partId TEXT NOT NULL,
                         diameterMm REAL NOT NULL,
                         lengthMm REAL NOT NULL,
@@ -117,6 +130,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS process_plans(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         name TEXT NOT NULL,
                         partId TEXT NOT NULL,
                         stockDiameterMm REAL NOT NULL,
@@ -129,6 +143,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS process_steps(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         planId TEXT NOT NULL,
                         orderIndex INTEGER NOT NULL,
                         type TEXT NOT NULL,
@@ -150,6 +165,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS drawings(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         filename TEXT NOT NULL,
                         layers INTEGER NOT NULL,
                         entities INTEGER NOT NULL,
@@ -162,6 +178,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS drawing_corrections(
                         drawingId TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         scale REAL NOT NULL,
                         offsetX REAL NOT NULL,
                         offsetY REAL NOT NULL,
@@ -176,6 +193,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS task_history(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         partName TEXT NOT NULL,
                         planId TEXT NOT NULL,
                         status TEXT NOT NULL,
@@ -190,6 +208,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS operation_logs(
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         device_id TEXT NOT NULL,
                         timestamp INTEGER NOT NULL,
                         level TEXT NOT NULL,
@@ -207,6 +226,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS devices(
                         id TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         unit_name TEXT NOT NULL,
                         contact_name TEXT NOT NULL,
                         phone TEXT NOT NULL,
@@ -224,6 +244,7 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS admin_sessions(
                         token TEXT PRIMARY KEY,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         username TEXT NOT NULL,
                         created_at INTEGER NOT NULL,
                         expires_at INTEGER NOT NULL
@@ -234,7 +255,8 @@ object Db {
                     """
                     CREATE TABLE IF NOT EXISTS users(
                         id TEXT PRIMARY KEY,
-                        username TEXT NOT NULL UNIQUE,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
+                        username TEXT NOT NULL,
                         password_hash TEXT NOT NULL,
                         display_name TEXT NOT NULL,
                         role TEXT NOT NULL,
@@ -247,7 +269,6 @@ object Db {
                 )
             }
         }
-        seedIfEmpty()
         // 旧库迁移：为 devices 表补充 hardware_id / app_version 列（已存在则忽略）
         withConn { c ->
             c.createStatement().use { st ->
@@ -270,6 +291,66 @@ object Db {
                 }
             }
         }
+        // 多租户迁移（ADR-0002）：全部业务表补 tenant_id 列；唯一索引升级为 (tenant_id, 原键)
+        withConn { c ->
+            c.createStatement().use { st ->
+                listOf(
+                    "tools", "materials", "parts", "blanks", "process_plans", "process_steps",
+                    "drawings", "drawing_corrections", "task_history", "operation_logs",
+                    "devices", "users", "admin_sessions"
+                ).forEach { table ->
+                    runCatching {
+                        st.executeUpdate("ALTER TABLE $table ADD COLUMN tenant_id TEXT NOT NULL DEFAULT '$DEFAULT_TENANT'")
+                    }
+                }
+                // users 用户名唯一性升级为 (tenant_id, username)：SQLite 无法删除列级
+                // UNIQUE 约束，老库（建表 sql 含 UNIQUE）需重建表，新库已是目标结构
+                val usersSql = st.executeQuery(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+                ).use { rs -> if (rs.next()) rs.getString(1) else null }
+                if (usersSql != null && usersSql.contains("UNIQUE", ignoreCase = true)) {
+                    st.executeUpdate(
+                        """
+                        CREATE TABLE users_new(
+                            id TEXT PRIMARY KEY,
+                            tenant_id TEXT NOT NULL DEFAULT 'default',
+                            username TEXT NOT NULL,
+                            password_hash TEXT NOT NULL,
+                            display_name TEXT NOT NULL,
+                            role TEXT NOT NULL,
+                            permissions TEXT NOT NULL,
+                            enabled INTEGER NOT NULL,
+                            created_at INTEGER NOT NULL,
+                            last_login_at INTEGER NOT NULL DEFAULT 0
+                        )
+                        """.trimIndent()
+                    )
+                    st.executeUpdate(
+                        """
+                        INSERT INTO users_new(id, tenant_id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
+                        SELECT id, tenant_id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at FROM users
+                        """.trimIndent()
+                    )
+                    st.executeUpdate("DROP TABLE users")
+                    st.executeUpdate("ALTER TABLE users_new RENAME TO users")
+                }
+                st.executeUpdate(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_tenant_username ON users(tenant_id, username)"
+                )
+                // devices 硬件标识唯一索引升级为 (tenant_id, hardware_id)
+                st.executeUpdate("DROP INDEX IF EXISTS idx_devices_hardware_id")
+                st.executeUpdate(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_devices_tenant_hardware ON devices(tenant_id, hardware_id) WHERE hardware_id != ''"
+                )
+                // 日志查询索引带租户前缀
+                st.executeUpdate("DROP INDEX IF EXISTS idx_op_logs_device")
+                st.executeUpdate(
+                    "CREATE INDEX IF NOT EXISTS idx_op_logs_tenant_device ON operation_logs(tenant_id, device_id, timestamp DESC)"
+                )
+            }
+        }
+        // 种子数据必须在全部列迁移之后执行：老库表结构在迁移前不含 tenant_id 列
+        seedIfEmpty()
         // 管理员账号/密码：首次启动写默认值，已存在则保留后台设置
         withConn { c ->
             if (c.getMeta("admin_username") == null) c.putMeta("admin_username", DEFAULT_ADMIN_USERNAME)
@@ -320,18 +401,18 @@ object Db {
         putMeta("config_version", next.toString())
     }
 
-    /** 一次读取完整配置。 */
-    fun snapshot(): ConfigSnapshot = withConn { c ->
+    /** 一次读取完整配置（按租户隔离；device 为服务器级全局机床配置）。 */
+    fun snapshot(tenantId: String = DEFAULT_TENANT): ConfigSnapshot = withConn { c ->
         ConfigSnapshot(
             version = c.getMeta("config_version")?.toLongOrNull() ?: 1L,
             device = readDevice(c),
-            tools = readTools(c),
-            materials = readMaterials(c),
-            parts = readParts(c),
-            blanks = readBlanks(c),
-            plans = readPlans(c),
-            drawings = readDrawings(c),
-            drawingCorrections = readCorrections(c)
+            tools = readTools(c, tenantId),
+            materials = readMaterials(c, tenantId),
+            parts = readParts(c, tenantId),
+            blanks = readBlanks(c, tenantId),
+            plans = readPlans(c, tenantId),
+            drawings = readDrawings(c, tenantId),
+            drawingCorrections = readCorrections(c, tenantId)
         )
     }
 
@@ -356,8 +437,9 @@ object Db {
 
     // ===== 刀具 =====
 
-    private fun readTools(c: Connection): List<ToolConfig> =
-        c.prepareStatement("SELECT * FROM tools ORDER BY toolNumber").use { ps ->
+    private fun readTools(c: Connection, tenantId: String): List<ToolConfig> =
+        c.prepareStatement("SELECT * FROM tools WHERE tenant_id = ? ORDER BY toolNumber").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -380,30 +462,31 @@ object Db {
             }
         }
 
-    fun upsertTool(tool: ToolConfig): ToolConfig = withConn { c ->
+    fun upsertTool(tool: ToolConfig, tenantId: String = DEFAULT_TENANT): ToolConfig = withConn { c ->
         val id = tool.id.ifBlank { "tool-${UUID.randomUUID().toString().take(8)}" }
         val saved = tool.copy(id = id)
         c.tx {
             c.prepareStatement(
                 """
                 INSERT OR REPLACE INTO tools(
-                    id, toolNumber, toolType, name, material, nominalDiameterMm, lengthMm,
+                    id, tenant_id, toolNumber, toolType, name, material, nominalDiameterMm, lengthMm,
                     maxRpm, maxFeedMmPerMin, wearStatus, usageCount, notes
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setInt(2, saved.toolNumber)
-                ps.setString(3, saved.toolType)
-                ps.setString(4, saved.name)
-                ps.setString(5, saved.material)
-                ps.setDouble(6, saved.nominalDiameterMm)
-                ps.setDouble(7, saved.lengthMm)
-                ps.setInt(8, saved.maxRpm)
-                ps.setDouble(9, saved.maxFeedMmPerMin)
-                ps.setString(10, saved.wearStatus)
-                ps.setInt(11, saved.usageCount)
-                ps.setString(12, saved.notes)
+                ps.setString(2, tenantId)
+                ps.setInt(3, saved.toolNumber)
+                ps.setString(4, saved.toolType)
+                ps.setString(5, saved.name)
+                ps.setString(6, saved.material)
+                ps.setDouble(7, saved.nominalDiameterMm)
+                ps.setDouble(8, saved.lengthMm)
+                ps.setInt(9, saved.maxRpm)
+                ps.setDouble(10, saved.maxFeedMmPerMin)
+                ps.setString(11, saved.wearStatus)
+                ps.setInt(12, saved.usageCount)
+                ps.setString(13, saved.notes)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -411,12 +494,13 @@ object Db {
         saved
     }
 
-    fun deleteTool(id: String) = deleteById("tools", id)
+    fun deleteTool(id: String, tenantId: String = DEFAULT_TENANT) = deleteById("tools", id, tenantId)
 
     // ===== 材料 =====
 
-    private fun readMaterials(c: Connection): List<MaterialConfig> =
-        c.prepareStatement("SELECT * FROM materials ORDER BY name").use { ps ->
+    private fun readMaterials(c: Connection, tenantId: String): List<MaterialConfig> =
+        c.prepareStatement("SELECT * FROM materials WHERE tenant_id = ? ORDER BY name").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -437,28 +521,29 @@ object Db {
             }
         }
 
-    fun upsertMaterial(material: MaterialConfig): MaterialConfig = withConn { c ->
+    fun upsertMaterial(material: MaterialConfig, tenantId: String = DEFAULT_TENANT): MaterialConfig = withConn { c ->
         val id = material.id.ifBlank { "mat-${UUID.randomUUID().toString().take(8)}" }
         val saved = material.copy(id = id)
         c.tx {
             c.prepareStatement(
                 """
                 INSERT OR REPLACE INTO materials(
-                    id, name, code, density, hardness, recommendedCuttingSpeedMs,
+                    id, tenant_id, name, code, density, hardness, recommendedCuttingSpeedMs,
                     recommendedFeedPerRev, recommendedDepthMm, enabled, notes
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setString(2, saved.name)
-                ps.setString(3, saved.code)
-                ps.setDouble(4, saved.density)
-                ps.setString(5, saved.hardness)
-                ps.setDouble(6, saved.recommendedCuttingSpeedMs)
-                ps.setDouble(7, saved.recommendedFeedPerRev)
-                ps.setDouble(8, saved.recommendedDepthMm)
-                ps.setInt(9, if (saved.enabled) 1 else 0)
-                ps.setString(10, saved.notes)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.name)
+                ps.setString(4, saved.code)
+                ps.setDouble(5, saved.density)
+                ps.setString(6, saved.hardness)
+                ps.setDouble(7, saved.recommendedCuttingSpeedMs)
+                ps.setDouble(8, saved.recommendedFeedPerRev)
+                ps.setDouble(9, saved.recommendedDepthMm)
+                ps.setInt(10, if (saved.enabled) 1 else 0)
+                ps.setString(11, saved.notes)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -466,12 +551,13 @@ object Db {
         saved
     }
 
-    fun deleteMaterial(id: String) = deleteById("materials", id)
+    fun deleteMaterial(id: String, tenantId: String = DEFAULT_TENANT) = deleteById("materials", id, tenantId)
 
     // ===== 零件 / 毛坯 =====
 
-    private fun readParts(c: Connection): List<PartConfig> =
-        c.prepareStatement("SELECT * FROM parts ORDER BY name").use { ps ->
+    private fun readParts(c: Connection, tenantId: String): List<PartConfig> =
+        c.prepareStatement("SELECT * FROM parts WHERE tenant_id = ? ORDER BY name").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -486,17 +572,18 @@ object Db {
             }
         }
 
-    fun upsertPart(part: PartConfig): PartConfig = withConn { c ->
+    fun upsertPart(part: PartConfig, tenantId: String = DEFAULT_TENANT): PartConfig = withConn { c ->
         val id = part.id.ifBlank { "part-${UUID.randomUUID().toString().take(8)}" }
         val saved = part.copy(id = id)
         c.tx {
             c.prepareStatement(
-                "INSERT OR REPLACE INTO parts(id, name, materialId, notes) VALUES(?,?,?,?)"
+                "INSERT OR REPLACE INTO parts(id, tenant_id, name, materialId, notes) VALUES(?,?,?,?,?)"
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setString(2, saved.name)
-                ps.setString(3, saved.materialId)
-                ps.setString(4, saved.notes)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.name)
+                ps.setString(4, saved.materialId)
+                ps.setString(5, saved.notes)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -504,10 +591,11 @@ object Db {
         saved
     }
 
-    fun deletePart(id: String) = deleteById("parts", id)
+    fun deletePart(id: String, tenantId: String = DEFAULT_TENANT) = deleteById("parts", id, tenantId)
 
-    private fun readBlanks(c: Connection): List<BlankConfig> =
-        c.prepareStatement("SELECT * FROM blanks").use { ps ->
+    private fun readBlanks(c: Connection, tenantId: String): List<BlankConfig> =
+        c.prepareStatement("SELECT * FROM blanks WHERE tenant_id = ?").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -524,22 +612,23 @@ object Db {
             }
         }
 
-    fun upsertBlank(blank: BlankConfig): BlankConfig = withConn { c ->
+    fun upsertBlank(blank: BlankConfig, tenantId: String = DEFAULT_TENANT): BlankConfig = withConn { c ->
         val id = blank.id.ifBlank { "blank-${UUID.randomUUID().toString().take(8)}" }
         val saved = blank.copy(id = id)
         c.tx {
             c.prepareStatement(
                 """
-                INSERT OR REPLACE INTO blanks(id, partId, diameterMm, lengthMm, materialId, clampType)
-                VALUES(?,?,?,?,?,?)
+                INSERT OR REPLACE INTO blanks(id, tenant_id, partId, diameterMm, lengthMm, materialId, clampType)
+                VALUES(?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setString(2, saved.partId)
-                ps.setDouble(3, saved.diameterMm)
-                ps.setDouble(4, saved.lengthMm)
-                ps.setString(5, saved.materialId)
-                ps.setString(6, saved.clampType)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.partId)
+                ps.setDouble(4, saved.diameterMm)
+                ps.setDouble(5, saved.lengthMm)
+                ps.setString(6, saved.materialId)
+                ps.setString(7, saved.clampType)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -547,14 +636,15 @@ object Db {
         saved
     }
 
-    fun deleteBlank(id: String) = deleteById("blanks", id)
+    fun deleteBlank(id: String, tenantId: String = DEFAULT_TENANT) = deleteById("blanks", id, tenantId)
 
     // ===== 工艺方案 =====
 
-    private fun readPlans(c: Connection): List<ProcessPlanConfig> {
+    private fun readPlans(c: Connection, tenantId: String): List<ProcessPlanConfig> {
         val steps = c.prepareStatement(
-            "SELECT * FROM process_steps ORDER BY planId, orderIndex"
+            "SELECT * FROM process_steps WHERE tenant_id = ? ORDER BY planId, orderIndex"
         ).use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -580,7 +670,8 @@ object Db {
             }
         }.groupBy { it.planId }
 
-        return c.prepareStatement("SELECT * FROM process_plans ORDER BY name").use { ps ->
+        return c.prepareStatement("SELECT * FROM process_plans WHERE tenant_id = ? ORDER BY name").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) {
@@ -602,26 +693,28 @@ object Db {
         }
     }
 
-    fun upsertPlan(plan: ProcessPlanConfig): ProcessPlanConfig = withConn { c ->
+    fun upsertPlan(plan: ProcessPlanConfig, tenantId: String = DEFAULT_TENANT): ProcessPlanConfig = withConn { c ->
         val id = plan.id.ifBlank { "plan-${UUID.randomUUID().toString().take(8)}" }
         val saved = plan.copy(id = id)
         c.tx {
             c.prepareStatement(
                 """
-                INSERT OR REPLACE INTO process_plans(id, name, partId, stockDiameterMm, stockLengthMm, description)
-                VALUES(?,?,?,?,?,?)
+                INSERT OR REPLACE INTO process_plans(id, tenant_id, name, partId, stockDiameterMm, stockLengthMm, description)
+                VALUES(?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setString(2, saved.name)
-                ps.setString(3, saved.partId)
-                ps.setDouble(4, saved.stockDiameterMm)
-                ps.setDouble(5, saved.stockLengthMm)
-                ps.setString(6, saved.description)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.name)
+                ps.setString(4, saved.partId)
+                ps.setDouble(5, saved.stockDiameterMm)
+                ps.setDouble(6, saved.stockLengthMm)
+                ps.setString(7, saved.description)
                 ps.executeUpdate()
             }
-            c.prepareStatement("DELETE FROM process_steps WHERE planId = ?").use { ps ->
+            c.prepareStatement("DELETE FROM process_steps WHERE planId = ? AND tenant_id = ?").use { ps ->
                 ps.setString(1, id)
+                ps.setString(2, tenantId)
                 ps.executeUpdate()
             }
             saved.steps.forEachIndexed { index, step ->
@@ -629,27 +722,28 @@ object Db {
                 c.prepareStatement(
                     """
                     INSERT OR REPLACE INTO process_steps(
-                        id, planId, orderIndex, type, toolId, cuttingSpeedMmPerMin, spindleRpm,
+                        id, tenant_id, planId, orderIndex, type, toolId, cuttingSpeedMmPerMin, spindleRpm,
                         feedMmPerRev, depthOfCutMm, finishAllowanceMm, approachDistanceMm,
                         retractDistanceMm, safetyDistanceMm, enabled, notes
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """.trimIndent()
                 ).use { ps ->
                     ps.setString(1, stepId)
-                    ps.setString(2, id)
-                    ps.setInt(3, step.orderIndex.takeIf { it > 0 } ?: index)
-                    ps.setString(4, step.type)
-                    ps.setString(5, step.toolId)
-                    ps.setDouble(6, step.cuttingSpeedMmPerMin)
-                    ps.setInt(7, step.spindleRpm)
-                    ps.setDouble(8, step.feedMmPerRev)
-                    ps.setDouble(9, step.depthOfCutMm)
-                    ps.setDouble(10, step.finishAllowanceMm)
-                    ps.setDouble(11, step.approachDistanceMm)
-                    ps.setDouble(12, step.retractDistanceMm)
-                    ps.setDouble(13, step.safetyDistanceMm)
-                    ps.setInt(14, if (step.enabled) 1 else 0)
-                    ps.setString(15, step.notes)
+                    ps.setString(2, tenantId)
+                    ps.setString(3, id)
+                    ps.setInt(4, step.orderIndex.takeIf { it > 0 } ?: index)
+                    ps.setString(5, step.type)
+                    ps.setString(6, step.toolId)
+                    ps.setDouble(7, step.cuttingSpeedMmPerMin)
+                    ps.setInt(8, step.spindleRpm)
+                    ps.setDouble(9, step.feedMmPerRev)
+                    ps.setDouble(10, step.depthOfCutMm)
+                    ps.setDouble(11, step.finishAllowanceMm)
+                    ps.setDouble(12, step.approachDistanceMm)
+                    ps.setDouble(13, step.retractDistanceMm)
+                    ps.setDouble(14, step.safetyDistanceMm)
+                    ps.setInt(15, if (step.enabled) 1 else 0)
+                    ps.setString(16, step.notes)
                     ps.executeUpdate()
                 }
             }
@@ -658,13 +752,13 @@ object Db {
         saved
     }
 
-    fun deletePlan(id: String) = withConn { c ->
+    fun deletePlan(id: String, tenantId: String = DEFAULT_TENANT) = withConn { c ->
         c.tx {
-            c.prepareStatement("DELETE FROM process_steps WHERE planId = ?").use { ps ->
-                ps.setString(1, id); ps.executeUpdate()
+            c.prepareStatement("DELETE FROM process_steps WHERE planId = ? AND tenant_id = ?").use { ps ->
+                ps.setString(1, id); ps.setString(2, tenantId); ps.executeUpdate()
             }
-            c.prepareStatement("DELETE FROM process_plans WHERE id = ?").use { ps ->
-                ps.setString(1, id); ps.executeUpdate()
+            c.prepareStatement("DELETE FROM process_plans WHERE id = ? AND tenant_id = ?").use { ps ->
+                ps.setString(1, id); ps.setString(2, tenantId); ps.executeUpdate()
             }
             c.bumpVersion()
         }
@@ -672,8 +766,9 @@ object Db {
 
     // ===== 图纸 =====
 
-    private fun readDrawings(c: Connection): List<DrawingConfig> =
-        c.prepareStatement("SELECT * FROM drawings ORDER BY filename").use { ps ->
+    private fun readDrawings(c: Connection, tenantId: String): List<DrawingConfig> =
+        c.prepareStatement("SELECT * FROM drawings WHERE tenant_id = ? ORDER BY filename").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -690,22 +785,23 @@ object Db {
             }
         }
 
-    fun upsertDrawing(drawing: DrawingConfig): DrawingConfig = withConn { c ->
+    fun upsertDrawing(drawing: DrawingConfig, tenantId: String = DEFAULT_TENANT): DrawingConfig = withConn { c ->
         val id = drawing.id.ifBlank { "drawing-${UUID.randomUUID().toString().take(8)}" }
         val saved = drawing.copy(id = id, source = drawing.source.ifBlank { "SERVER" })
         c.tx {
             c.prepareStatement(
                 """
-                INSERT OR REPLACE INTO drawings(id, filename, layers, entities, source, dxfContent)
-                VALUES(?,?,?,?,?,?)
+                INSERT OR REPLACE INTO drawings(id, tenant_id, filename, layers, entities, source, dxfContent)
+                VALUES(?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, id)
-                ps.setString(2, saved.filename)
-                ps.setInt(3, saved.layers)
-                ps.setInt(4, saved.entities)
-                ps.setString(5, saved.source)
-                ps.setString(6, saved.dxfContent)
+                ps.setString(2, tenantId)
+                ps.setString(3, saved.filename)
+                ps.setInt(4, saved.layers)
+                ps.setInt(5, saved.entities)
+                ps.setString(6, saved.source)
+                ps.setString(7, saved.dxfContent)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -713,20 +809,21 @@ object Db {
         saved
     }
 
-    fun deleteDrawing(id: String) = withConn { c ->
+    fun deleteDrawing(id: String, tenantId: String = DEFAULT_TENANT) = withConn { c ->
         c.tx {
-            c.prepareStatement("DELETE FROM drawings WHERE id = ?").use { ps ->
-                ps.setString(1, id); ps.executeUpdate()
+            c.prepareStatement("DELETE FROM drawings WHERE id = ? AND tenant_id = ?").use { ps ->
+                ps.setString(1, id); ps.setString(2, tenantId); ps.executeUpdate()
             }
-            c.prepareStatement("DELETE FROM drawing_corrections WHERE drawingId = ?").use { ps ->
-                ps.setString(1, id); ps.executeUpdate()
+            c.prepareStatement("DELETE FROM drawing_corrections WHERE drawingId = ? AND tenant_id = ?").use { ps ->
+                ps.setString(1, id); ps.setString(2, tenantId); ps.executeUpdate()
             }
             c.bumpVersion()
         }
     }
 
-    private fun readCorrections(c: Connection): List<DrawingCorrectionConfig> =
-        c.prepareStatement("SELECT * FROM drawing_corrections").use { ps ->
+    private fun readCorrections(c: Connection, tenantId: String): List<DrawingCorrectionConfig> =
+        c.prepareStatement("SELECT * FROM drawing_corrections WHERE tenant_id = ?").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -745,23 +842,24 @@ object Db {
             }
         }
 
-    fun upsertCorrection(correction: DrawingCorrectionConfig): DrawingCorrectionConfig = withConn { c ->
+    fun upsertCorrection(correction: DrawingCorrectionConfig, tenantId: String = DEFAULT_TENANT): DrawingCorrectionConfig = withConn { c ->
         c.tx {
             c.prepareStatement(
                 """
                 INSERT OR REPLACE INTO drawing_corrections(
-                    drawingId, scale, offsetX, offsetY, rotationDeg, mirrorX, mirrorY, unit
-                ) VALUES(?,?,?,?,?,?,?,?)
+                    drawingId, tenant_id, scale, offsetX, offsetY, rotationDeg, mirrorX, mirrorY, unit
+                ) VALUES(?,?,?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, correction.drawingId)
-                ps.setDouble(2, correction.scale)
-                ps.setDouble(3, correction.offsetX)
-                ps.setDouble(4, correction.offsetY)
-                ps.setDouble(5, correction.rotationDeg)
-                ps.setInt(6, if (correction.mirrorX) 1 else 0)
-                ps.setInt(7, if (correction.mirrorY) 1 else 0)
-                ps.setString(8, correction.unit)
+                ps.setString(2, tenantId)
+                ps.setDouble(3, correction.scale)
+                ps.setDouble(4, correction.offsetX)
+                ps.setDouble(5, correction.offsetY)
+                ps.setDouble(6, correction.rotationDeg)
+                ps.setInt(7, if (correction.mirrorX) 1 else 0)
+                ps.setInt(8, if (correction.mirrorY) 1 else 0)
+                ps.setString(9, correction.unit)
                 ps.executeUpdate()
             }
             c.bumpVersion()
@@ -771,9 +869,10 @@ object Db {
 
     // ===== 任务记录 =====
 
-    fun tasks(limit: Int = 200): List<TaskRecord> = withConn { c ->
-        c.prepareStatement("SELECT * FROM task_history ORDER BY finishedAt DESC LIMIT ?").use { ps ->
-            ps.setInt(1, limit)
+    fun tasks(limit: Int = 200, tenantId: String = DEFAULT_TENANT): List<TaskRecord> = withConn { c ->
+        c.prepareStatement("SELECT * FROM task_history WHERE tenant_id = ? ORDER BY finishedAt DESC LIMIT ?").use { ps ->
+            ps.setString(1, tenantId)
+            ps.setInt(2, limit)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -793,24 +892,25 @@ object Db {
         }
     }
 
-    fun upsertTask(task: TaskRecord): TaskRecord = withConn { c ->
+    fun upsertTask(task: TaskRecord, tenantId: String = DEFAULT_TENANT): TaskRecord = withConn { c ->
         val id = task.id.ifBlank { "task-${UUID.randomUUID().toString().take(8)}" }
         val saved = task.copy(id = id)
         c.prepareStatement(
             """
             INSERT OR REPLACE INTO task_history(
-                id, partName, planId, status, durationSec, operator, startedAt, finishedAt
-            ) VALUES(?,?,?,?,?,?,?,?)
+                id, tenant_id, partName, planId, status, durationSec, operator, startedAt, finishedAt
+            ) VALUES(?,?,?,?,?,?,?,?,?)
             """.trimIndent()
         ).use { ps ->
             ps.setString(1, id)
-            ps.setString(2, saved.partName)
-            ps.setString(3, saved.planId)
-            ps.setString(4, saved.status)
-            ps.setDouble(5, saved.durationSec)
-            ps.setString(6, saved.operator)
-            ps.setLong(7, saved.startedAt)
-            ps.setLong(8, saved.finishedAt)
+            ps.setString(2, tenantId)
+            ps.setString(3, saved.partName)
+            ps.setString(4, saved.planId)
+            ps.setString(5, saved.status)
+            ps.setDouble(6, saved.durationSec)
+            ps.setString(7, saved.operator)
+            ps.setLong(8, saved.startedAt)
+            ps.setLong(9, saved.finishedAt)
             ps.executeUpdate()
         }
         saved
@@ -824,10 +924,10 @@ object Db {
         }
     }
 
-    fun saveStatus(status: DeviceStatus) = withConn { c ->
+    fun saveStatus(status: DeviceStatus, tenantId: String = DEFAULT_TENANT) = withConn { c ->
         c.putMeta("last_status", json.encodeToString(DeviceStatus.serializer(), status))
         // 同步更新对应设备的在线时间
-        c.heartbeatOnly(status.deviceId)
+        c.heartbeatOnly(status.deviceId, tenantId)
     }
 
     // ===== 设备注册 / 权限 / 管理员密码 =====
@@ -836,14 +936,15 @@ object Db {
         runCatching { json.decodeFromString<ClientPermissions>(raw) }.getOrDefault(ClientPermissions())
 
     /** 按硬件标识查设备（用于激活幂等判定）。 */
-    fun findByHardwareId(hardwareId: String): DeviceInfo? = withConn { c ->
+    fun findByHardwareId(hardwareId: String, tenantId: String = DEFAULT_TENANT): DeviceInfo? = withConn { c ->
         if (hardwareId.isBlank()) return@withConn null
         var id: String? = null
-        c.prepareStatement("SELECT id FROM devices WHERE hardware_id = ?").use { ps ->
+        c.prepareStatement("SELECT id FROM devices WHERE hardware_id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, hardwareId)
+            ps.setString(2, tenantId)
             ps.executeQuery().use { rs -> if (rs.next()) id = rs.getString(1) }
         }
-        id?.let { getDevice(it) }
+        id?.let { getDevice(it, tenantId) }
     }
 
     /**
@@ -858,7 +959,7 @@ object Db {
      * 永久无法使用；同一硬件标识重复激活本就属于同一台设备，幂等更新才是
      * 正确的正式流程。查询与写入在同一连接内完成，避免与唯一索引冲突。
      */
-    fun registerDevice(req: RegisterRequest): DeviceInfo = withConn { c ->
+    fun registerDevice(req: RegisterRequest, tenantId: String = DEFAULT_TENANT): DeviceInfo = withConn { c ->
         val now = System.currentTimeMillis()
         if (req.hardwareId.isNotBlank()) {
             var existingId: String? = null
@@ -866,9 +967,10 @@ object Db {
             var existingRegisteredAt = 0L
             var existingPerms = ClientPermissions()
             c.prepareStatement(
-                "SELECT id, registered_at, permissions, device_token FROM devices WHERE hardware_id = ?"
+                "SELECT id, registered_at, permissions, device_token FROM devices WHERE hardware_id = ? AND tenant_id = ?"
             ).use { ps ->
                 ps.setString(1, req.hardwareId)
+                ps.setString(2, tenantId)
                 ps.executeQuery().use { rs ->
                     if (rs.next()) {
                         existingId = rs.getString("id")
@@ -916,31 +1018,32 @@ object Db {
             }
         }
         val id = req.deviceId.ifBlank { "dev-${UUID.randomUUID().toString().take(8)}" }
-        val existingPerms = c.getDeviceRaw(id)?.let { decodePermissions(it) } ?: ClientPermissions()
+        val existingPerms = c.getDeviceRaw(id, tenantId)?.let { decodePermissions(it) } ?: ClientPermissions()
         // 签发设备令牌：客户端后续用它访问配置/任务/状态接口
         val token = UUID.randomUUID().toString().replace("-", "")
         c.prepareStatement(
             """
             INSERT OR REPLACE INTO devices(
-                id, unit_name, contact_name, phone, province, city, server_address,
+                id, tenant_id, unit_name, contact_name, phone, province, city, server_address,
                 registered_at, last_seen, online, permissions, hardware_id, app_version, device_token
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """.trimIndent()
         ).use { ps ->
             ps.setString(1, id)
-            ps.setString(2, req.unitName)
-            ps.setString(3, req.contactName)
-            ps.setString(4, req.phone)
-            ps.setString(5, req.province)
-            ps.setString(6, req.city)
-            ps.setString(7, req.serverAddress)
-            ps.setLong(8, now)
+            ps.setString(2, tenantId)
+            ps.setString(3, req.unitName)
+            ps.setString(4, req.contactName)
+            ps.setString(5, req.phone)
+            ps.setString(6, req.province)
+            ps.setString(7, req.city)
+            ps.setString(8, req.serverAddress)
             ps.setLong(9, now)
-            ps.setInt(10, 1)
-            ps.setString(11, json.encodeToString(ClientPermissions.serializer(), existingPerms))
-            ps.setString(12, req.hardwareId)
-            ps.setString(13, req.appVersion)
-            ps.setString(14, token)
+            ps.setLong(10, now)
+            ps.setInt(11, 1)
+            ps.setString(12, json.encodeToString(ClientPermissions.serializer(), existingPerms))
+            ps.setString(13, req.hardwareId)
+            ps.setString(14, req.appVersion)
+            ps.setString(15, token)
             ps.executeUpdate()
         }
         DeviceInfo(
@@ -953,9 +1056,9 @@ object Db {
     }
 
     /** 后台修改设备信息（单位/联系人/电话/地区）。 */
-    fun updateDeviceInfo(id: String, req: DeviceUpdateRequest): Boolean = withConn { c ->
+    fun updateDeviceInfo(id: String, req: DeviceUpdateRequest, tenantId: String = DEFAULT_TENANT): Boolean = withConn { c ->
         c.prepareStatement(
-            "UPDATE devices SET unit_name = ?, contact_name = ?, phone = ?, province = ?, city = ? WHERE id = ?"
+            "UPDATE devices SET unit_name = ?, contact_name = ?, phone = ?, province = ?, city = ? WHERE id = ? AND tenant_id = ?"
         ).use { ps ->
             ps.setString(1, req.unitName)
             ps.setString(2, req.contactName)
@@ -963,25 +1066,28 @@ object Db {
             ps.setString(4, req.province)
             ps.setString(5, req.city)
             ps.setString(6, id)
+            ps.setString(7, tenantId)
             ps.executeUpdate() > 0
         }
     }
 
     /** 注销设备：删除后该设备才能重新注册。 */
-    fun deleteDevice(id: String): Boolean = withConn { c ->
-        c.prepareStatement("DELETE FROM devices WHERE id = ?").use { ps ->
+    fun deleteDevice(id: String, tenantId: String = DEFAULT_TENANT): Boolean = withConn { c ->
+        c.prepareStatement("DELETE FROM devices WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, id)
+            ps.setString(2, tenantId)
             ps.executeUpdate() > 0
         }
     }
 
-    fun getDevice(id: String): DeviceInfo? = withConn { c ->
-        val permsRaw = c.getDeviceRaw(id) ?: return@withConn null
+    fun getDevice(id: String, tenantId: String = DEFAULT_TENANT): DeviceInfo? = withConn { c ->
+        val permsRaw = c.getDeviceRaw(id, tenantId) ?: return@withConn null
         var info: DeviceInfo? = null
         c.prepareStatement(
-            "SELECT unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, device_token FROM devices WHERE id = ?"
+            "SELECT unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, device_token FROM devices WHERE id = ? AND tenant_id = ?"
         ).use { ps ->
             ps.setString(1, id)
+            ps.setString(2, tenantId)
             ps.executeQuery().use { rs ->
                 if (rs.next()) {
                     info = DeviceInfo(
@@ -1004,10 +1110,11 @@ object Db {
         info
     }
 
-    fun listDevices(): List<DeviceListItem> = withConn { c ->
+    fun listDevices(tenantId: String = DEFAULT_TENANT): List<DeviceListItem> = withConn { c ->
         c.prepareStatement(
-            "SELECT id, unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, app_version, permissions FROM devices ORDER BY registered_at DESC"
+            "SELECT id, unit_name, contact_name, phone, province, city, server_address, registered_at, last_seen, online, app_version, permissions FROM devices WHERE tenant_id = ? ORDER BY registered_at DESC"
         ).use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) add(
@@ -1032,10 +1139,11 @@ object Db {
     }
 
     /** 按「单位 + 省份 + 城市」统计终端数量（后台客户维护用）。 */
-    fun orgSummary(): List<OrgSummaryItem> = withConn { c ->
+    fun orgSummary(tenantId: String = DEFAULT_TENANT): List<OrgSummaryItem> = withConn { c ->
         c.prepareStatement(
-            "SELECT unit_name, province, city, last_seen FROM devices"
+            "SELECT unit_name, province, city, last_seen FROM devices WHERE tenant_id = ?"
         ).use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 val groups = LinkedHashMap<Triple<String, String, String>, MutableList<Long>>()
                 while (rs.next()) {
@@ -1064,28 +1172,29 @@ object Db {
     private fun isOnline(lastSeen: Long): Boolean =
         lastSeen > 0 && System.currentTimeMillis() - lastSeen < 25_000L
 
-    fun updateDevicePermissions(id: String, permissions: ClientPermissions): Boolean = withConn { c ->
-        val changed = c.prepareStatement("UPDATE devices SET permissions = ? WHERE id = ?").use { ps ->
+    fun updateDevicePermissions(id: String, permissions: ClientPermissions, tenantId: String = DEFAULT_TENANT): Boolean = withConn { c ->
+        val changed = c.prepareStatement("UPDATE devices SET permissions = ? WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, json.encodeToString(ClientPermissions.serializer(), permissions))
             ps.setString(2, id)
+            ps.setString(3, tenantId)
             ps.executeUpdate()
         }
         changed > 0
     }
 
     /** 心跳：刷新在线时间，并顺带更新客户端版本号。 */
-    fun heartbeat(id: String, appVersion: String = ""): DeviceInfo? = withConn { c ->
+    fun heartbeat(id: String, appVersion: String = "", tenantId: String = DEFAULT_TENANT): DeviceInfo? = withConn { c ->
         val now = System.currentTimeMillis()
         if (appVersion.isNotBlank()) {
-            c.prepareStatement("UPDATE devices SET last_seen = ?, online = 1, app_version = ? WHERE id = ?").use { ps ->
-                ps.setLong(1, now); ps.setString(2, appVersion); ps.setString(3, id); ps.executeUpdate()
+            c.prepareStatement("UPDATE devices SET last_seen = ?, online = 1, app_version = ? WHERE id = ? AND tenant_id = ?").use { ps ->
+                ps.setLong(1, now); ps.setString(2, appVersion); ps.setString(3, id); ps.setString(4, tenantId); ps.executeUpdate()
             }
         } else {
-            c.prepareStatement("UPDATE devices SET last_seen = ?, online = 1 WHERE id = ?").use { ps ->
-                ps.setLong(1, now); ps.setString(2, id); ps.executeUpdate()
+            c.prepareStatement("UPDATE devices SET last_seen = ?, online = 1 WHERE id = ? AND tenant_id = ?").use { ps ->
+                ps.setLong(1, now); ps.setString(2, id); ps.setString(3, tenantId); ps.executeUpdate()
             }
         }
-        getDevice(id)
+        getDevice(id, tenantId)
     }
 
     // ===== 客户端版本发布（自动更新） =====
@@ -1113,17 +1222,18 @@ object Db {
         )
     }
 
-    private fun Connection.heartbeatOnly(id: String) {
+    private fun Connection.heartbeatOnly(id: String, tenantId: String) {
         if (id.isBlank()) return
         val now = System.currentTimeMillis()
-        prepareStatement("UPDATE devices SET last_seen = ?, online = 1 WHERE id = ?").use { ps ->
-            ps.setLong(1, now); ps.setString(2, id); ps.executeUpdate()
+        prepareStatement("UPDATE devices SET last_seen = ?, online = 1 WHERE id = ? AND tenant_id = ?").use { ps ->
+            ps.setLong(1, now); ps.setString(2, id); ps.setString(3, tenantId); ps.executeUpdate()
         }
     }
 
-    private fun Connection.getDeviceRaw(id: String): String? =
-        prepareStatement("SELECT permissions FROM devices WHERE id = ?").use { ps ->
+    private fun Connection.getDeviceRaw(id: String, tenantId: String): String? =
+        prepareStatement("SELECT permissions FROM devices WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, id)
+            ps.setString(2, tenantId)
             ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
         }
 
@@ -1140,6 +1250,15 @@ object Db {
     fun deviceIdByToken(token: String): String? = withConn { c ->
         if (token.isBlank()) return@withConn null
         c.prepareStatement("SELECT id FROM devices WHERE device_token = ? AND device_token != '' LIMIT 1").use { ps ->
+            ps.setString(1, token)
+            ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
+        }
+    }
+
+    /** 设备令牌所属租户（路由层租户上下文校验用）；令牌无效返回 null。 */
+    fun tenantIdOfDeviceToken(token: String): String? = withConn { c ->
+        if (token.isBlank()) return@withConn null
+        c.prepareStatement("SELECT tenant_id FROM devices WHERE device_token = ? AND device_token != '' LIMIT 1").use { ps ->
             ps.setString(1, token)
             ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1) else null }
         }
@@ -1163,11 +1282,13 @@ object Db {
         c.putMeta("admin_username", newUsername)
     }
 
-    /** 校验后台登录账号密码。优先 users 表；老库无对应用户时才回退到 meta 旧账号（兼容升级）。 */
-    fun verifyAdminAccount(username: String, password: String): Boolean {
-        if (verifyUserAccount(username, password) != null) return true
+    /** 校验后台登录账号密码。优先 users 表；默认租户下老库无对应用户时才回退到 meta 旧账号（兼容升级）。 */
+    fun verifyAdminAccount(username: String, password: String, tenantId: String = DEFAULT_TENANT): Boolean {
+        if (verifyUserAccount(username, password, tenantId) != null) return true
         // users 表中已存在该账号时不再回退，避免禁用/改密后的账号被 meta 旧口令绕过
-        if (findUserByUsername(username) != null) return false
+        if (findUserByUsername(username, tenantId) != null) return false
+        // meta 旧账号是私有化部署的服务器级回退，非默认租户禁用
+        if (tenantId != DEFAULT_TENANT) return false
         return withConn { c ->
             val u = c.getMeta("admin_username") ?: DEFAULT_ADMIN_USERNAME
             val p = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
@@ -1242,7 +1363,7 @@ object Db {
     const val SESSION_TTL_MS = 7L * 24 * 3600 * 1000
 
     /** 登录成功创建会话，返回 token。 */
-    fun createSession(username: String, userId: String = ""): String = withConn { c ->
+    fun createSession(username: String, userId: String = "", tenantId: String = DEFAULT_TENANT): String = withConn { c ->
         // 顺手清理过期会话
         c.prepareStatement("DELETE FROM admin_sessions WHERE expires_at < ?").use { ps ->
             ps.setLong(1, System.currentTimeMillis()); ps.executeUpdate()
@@ -1250,13 +1371,14 @@ object Db {
         val token = "sess-" + UUID.randomUUID().toString().replace("-", "")
         val now = System.currentTimeMillis()
         c.prepareStatement(
-            "INSERT INTO admin_sessions(token, username, created_at, expires_at, user_id) VALUES(?,?,?,?,?)"
+            "INSERT INTO admin_sessions(token, tenant_id, username, created_at, expires_at, user_id) VALUES(?,?,?,?,?,?)"
         ).use { ps ->
             ps.setString(1, token)
-            ps.setString(2, username)
-            ps.setLong(3, now)
-            ps.setLong(4, now + SESSION_TTL_MS)
-            ps.setString(5, userId)
+            ps.setString(2, tenantId)
+            ps.setString(3, username)
+            ps.setLong(4, now)
+            ps.setLong(5, now + SESSION_TTL_MS)
+            ps.setString(6, userId)
             ps.executeUpdate()
         }
         token
@@ -1302,24 +1424,27 @@ object Db {
 
     private fun encodePermissionList(list: List<String>): String = json.encodeToString(list)
 
-    fun listUsers(): List<UserDto> = withConn { c ->
-        c.prepareStatement("SELECT * FROM users ORDER BY created_at, username").use { ps ->
+    fun listUsers(tenantId: String = DEFAULT_TENANT): List<UserDto> = withConn { c ->
+        c.prepareStatement("SELECT * FROM users WHERE tenant_id = ? ORDER BY created_at, username").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs ->
                 buildList { while (rs.next()) add(rs.getUserRow().user) }
             }
         }
     }
 
-    fun findUserByUsername(username: String): UserDto? = withConn { c ->
-        c.prepareStatement("SELECT * FROM users WHERE username = ?").use { ps ->
+    fun findUserByUsername(username: String, tenantId: String = DEFAULT_TENANT): UserDto? = withConn { c ->
+        c.prepareStatement("SELECT * FROM users WHERE username = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, username)
+            ps.setString(2, tenantId)
             ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow().user else null }
         }
     }
 
-    fun findUserById(id: String): UserDto? = withConn { c ->
-        c.prepareStatement("SELECT * FROM users WHERE id = ?").use { ps ->
+    fun findUserById(id: String, tenantId: String = DEFAULT_TENANT): UserDto? = withConn { c ->
+        c.prepareStatement("SELECT * FROM users WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, id)
+            ps.setString(2, tenantId)
             ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow().user else null }
         }
     }
@@ -1329,33 +1454,36 @@ object Db {
         password: String,
         displayName: String,
         role: String,
-        permissions: List<String>
+        permissions: List<String>,
+        tenantId: String = DEFAULT_TENANT
     ): UserDto {
         val name = username.trim()
         require(name.isNotEmpty()) { "用户名不能为空" }
         val id = UUID.randomUUID().toString()
         val now = System.currentTimeMillis()
         withConn { c ->
-            val exists = c.prepareStatement("SELECT 1 FROM users WHERE username = ?").use { ps ->
+            val exists = c.prepareStatement("SELECT 1 FROM users WHERE username = ? AND tenant_id = ?").use { ps ->
                 ps.setString(1, name)
+                ps.setString(2, tenantId)
                 ps.executeQuery().use { rs -> rs.next() }
             }
             if (exists) throw IllegalArgumentException("用户名已存在")
             try {
                 c.prepareStatement(
                     """
-                    INSERT INTO users(id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
-                    VALUES(?,?,?,?,?,?,?,?,0)
+                    INSERT INTO users(id, tenant_id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,0)
                     """.trimIndent()
                 ).use { ps ->
                     ps.setString(1, id)
-                    ps.setString(2, name)
-                    ps.setString(3, hashPassword(password))
-                    ps.setString(4, displayName.ifBlank { name })
-                    ps.setString(5, role)
-                    ps.setString(6, encodePermissionList(permissions))
-                    ps.setInt(7, 1)
-                    ps.setLong(8, now)
+                    ps.setString(2, tenantId)
+                    ps.setString(3, name)
+                    ps.setString(4, hashPassword(password))
+                    ps.setString(5, displayName.ifBlank { name })
+                    ps.setString(6, role)
+                    ps.setString(7, encodePermissionList(permissions))
+                    ps.setInt(8, 1)
+                    ps.setLong(9, now)
                     ps.executeUpdate()
                 }
             } catch (e: java.sql.SQLException) {
@@ -1366,7 +1494,7 @@ object Db {
                 throw e
             }
         }
-        return findUserById(id) ?: throw IllegalStateException("创建用户失败")
+        return findUserById(id, tenantId) ?: throw IllegalStateException("创建用户失败")
     }
 
     fun updateUser(
@@ -1374,34 +1502,38 @@ object Db {
         displayName: String,
         role: String,
         permissions: List<String>,
-        enabled: Boolean
+        enabled: Boolean,
+        tenantId: String = DEFAULT_TENANT
     ): UserDto? {
         val changed = withConn { c ->
             c.prepareStatement(
-                "UPDATE users SET display_name = ?, role = ?, permissions = ?, enabled = ? WHERE id = ?"
+                "UPDATE users SET display_name = ?, role = ?, permissions = ?, enabled = ? WHERE id = ? AND tenant_id = ?"
             ).use { ps ->
                 ps.setString(1, displayName)
                 ps.setString(2, role)
                 ps.setString(3, encodePermissionList(permissions))
                 ps.setInt(4, if (enabled) 1 else 0)
                 ps.setString(5, id)
+                ps.setString(6, tenantId)
                 ps.executeUpdate()
             }
         }
-        return if (changed > 0) findUserById(id) else null
+        return if (changed > 0) findUserById(id, tenantId) else null
     }
 
-    fun deleteUser(id: String): Boolean = withConn { c ->
+    fun deleteUser(id: String, tenantId: String = DEFAULT_TENANT): Boolean = withConn { c ->
         // 同步清理该用户的会话（含老版本 user_id 为空、仅按用户名关联的会话）
         c.prepareStatement(
-            "DELETE FROM admin_sessions WHERE user_id = ? OR (user_id = '' AND username = (SELECT username FROM users WHERE id = ?))"
+            "DELETE FROM admin_sessions WHERE user_id = ? OR (user_id = '' AND username = (SELECT username FROM users WHERE id = ? AND tenant_id = ?))"
         ).use { ps ->
             ps.setString(1, id)
             ps.setString(2, id)
+            ps.setString(3, tenantId)
             ps.executeUpdate()
         }
-        c.prepareStatement("DELETE FROM users WHERE id = ?").use { ps ->
+        c.prepareStatement("DELETE FROM users WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, id)
+            ps.setString(2, tenantId)
             ps.executeUpdate() > 0
         }
     }
@@ -1417,80 +1549,95 @@ object Db {
         }
     }
 
-    fun resetUserPassword(id: String, newPassword: String): Boolean = withConn { c ->
-        c.prepareStatement("UPDATE users SET password_hash = ? WHERE id = ?").use { ps ->
+    fun resetUserPassword(id: String, newPassword: String, tenantId: String = DEFAULT_TENANT): Boolean = withConn { c ->
+        c.prepareStatement("UPDATE users SET password_hash = ? WHERE id = ? AND tenant_id = ?").use { ps ->
             ps.setString(1, hashPassword(newPassword))
             ps.setString(2, id)
+            ps.setString(3, tenantId)
             ps.executeUpdate() > 0
         }
     }
 
-    fun changeOwnPassword(id: String, oldPassword: String, newPassword: String): Boolean {
+    fun changeOwnPassword(id: String, oldPassword: String, newPassword: String, tenantId: String = DEFAULT_TENANT): Boolean {
         val row = withConn { c ->
-            c.prepareStatement("SELECT * FROM users WHERE id = ?").use { ps ->
+            c.prepareStatement("SELECT * FROM users WHERE id = ? AND tenant_id = ?").use { ps ->
                 ps.setString(1, id)
+                ps.setString(2, tenantId)
                 ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow() else null }
             }
         } ?: return false
         if (!verifyPassword(oldPassword, row.passwordHash)) return false
-        return resetUserPassword(id, newPassword)
+        return resetUserPassword(id, newPassword, tenantId)
     }
 
-    fun countSuperAdmins(): Int = withConn { c ->
-        c.prepareStatement("SELECT COUNT(*) FROM users WHERE role = 'SUPER_ADMIN'").use { ps ->
+    fun countSuperAdmins(tenantId: String = DEFAULT_TENANT): Int = withConn { c ->
+        c.prepareStatement("SELECT COUNT(*) FROM users WHERE role = 'SUPER_ADMIN' AND tenant_id = ?").use { ps ->
+            ps.setString(1, tenantId)
             ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) }
         }
     }
 
     /** 账号密码校验（仅启用用户），成功后刷新最后登录时间。 */
-    fun verifyUserAccount(username: String, password: String): SessionUser? {
+    fun verifyUserAccount(username: String, password: String, tenantId: String = DEFAULT_TENANT): SessionUser? {
         val row = withConn { c ->
-            c.prepareStatement("SELECT * FROM users WHERE username = ?").use { ps ->
+            c.prepareStatement("SELECT * FROM users WHERE username = ? AND tenant_id = ?").use { ps ->
                 ps.setString(1, username)
+                ps.setString(2, tenantId)
                 ps.executeQuery().use { rs -> if (rs.next()) rs.getUserRow() else null }
             }
         } ?: return null
         val user = row.user
         if (!user.enabled || !verifyPassword(password, row.passwordHash)) return null
         withConn { c ->
-            c.prepareStatement("UPDATE users SET last_login_at = ? WHERE id = ?").use { ps ->
+            c.prepareStatement("UPDATE users SET last_login_at = ? WHERE id = ? AND tenant_id = ?").use { ps ->
                 ps.setLong(1, System.currentTimeMillis())
                 ps.setString(2, user.id)
+                ps.setString(3, tenantId)
                 ps.executeUpdate()
             }
         }
-        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, true)
+        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, true, tenantId)
     }
 
-    /** 会话 token → 关联用户；老会话 user_id 为空时按用户名反查。 */
+    /** 会话 token → 关联用户；老会话 user_id 为空时按用户名反查（均在会话所属租户内）。 */
     fun getSessionUser(token: String): SessionUser? {
         if (token.isBlank()) return null
         val row = withConn { c ->
             c.prepareStatement(
-                "SELECT user_id, username FROM admin_sessions WHERE token = ? AND expires_at >= ?"
+                "SELECT user_id, username, tenant_id FROM admin_sessions WHERE token = ? AND expires_at >= ?"
             ).use { ps ->
                 ps.setString(1, token)
                 ps.setLong(2, System.currentTimeMillis())
                 ps.executeQuery().use { rs ->
-                    if (rs.next()) rs.getString("user_id") to rs.getString("username") else null
+                    if (rs.next()) {
+                        Triple(
+                            rs.getString("user_id"),
+                            rs.getString("username"),
+                            rs.getString("tenant_id")
+                        )
+                    } else {
+                        null
+                    }
                 }
             }
         } ?: return null
-        val user = if (row.first.isNotBlank()) findUserById(row.first) else findUserByUsername(row.second)
+        val tenant = normalizeTenant(row.third)
+        val user = if (row.first.isNotBlank()) findUserById(row.first, tenant) else findUserByUsername(row.second, tenant)
         if (user == null || !user.enabled) return null
-        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, user.enabled)
+        return SessionUser(user.id, user.username, user.displayName, user.role, user.permissions, user.enabled, tenant)
     }
 
-    /** 兼容旧「管理员账号密码」设置：同步更新种子超管账号，避免旧口令继续可用。 */
+    /** 兼容旧「管理员账号密码」设置：同步更新种子超管账号（固定默认租户），避免旧口令继续可用。 */
     fun syncLegacyAdminAccount(oldUsername: String, newUsername: String, newPassword: String): Boolean {
         if (oldUsername.isBlank()) return false
         return withConn { c ->
             c.prepareStatement(
-                "UPDATE users SET username = ?, password_hash = ? WHERE role = 'SUPER_ADMIN' AND username = ?"
+                "UPDATE users SET username = ?, password_hash = ? WHERE role = 'SUPER_ADMIN' AND username = ? AND tenant_id = ?"
             ).use { ps ->
                 ps.setString(1, newUsername)
                 ps.setString(2, hashPassword(newPassword))
                 ps.setString(3, oldUsername)
+                ps.setString(4, DEFAULT_TENANT)
                 ps.executeUpdate() > 0
             }
         }
@@ -1498,10 +1645,12 @@ object Db {
 
     // ===== 通用 =====
 
-    private fun deleteById(table: String, id: String) = withConn { c ->
+    private fun deleteById(table: String, id: String, tenantId: String) = withConn { c ->
         c.tx {
-            c.prepareStatement("DELETE FROM $table WHERE id = ?").use { ps ->
-                ps.setString(1, id); ps.executeUpdate()
+            c.prepareStatement("DELETE FROM $table WHERE id = ? AND tenant_id = ?").use { ps ->
+                ps.setString(1, id)
+                ps.setString(2, tenantId)
+                ps.executeUpdate()
             }
             c.bumpVersion()
         }
@@ -1545,18 +1694,19 @@ object Db {
             val password = c.getMeta("admin_password") ?: DEFAULT_ADMIN_PASSWORD
             c.prepareStatement(
                 """
-                INSERT INTO users(id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
-                VALUES(?,?,?,?,?,?,?,?,0)
+                INSERT INTO users(id, tenant_id, username, password_hash, display_name, role, permissions, enabled, created_at, last_login_at)
+                VALUES(?,?,?,?,?,?,?,?,?,0)
                 """.trimIndent()
             ).use { ps ->
                 ps.setString(1, UUID.randomUUID().toString())
-                ps.setString(2, username)
-                ps.setString(3, hashPassword(password))
-                ps.setString(4, "超级管理员")
-                ps.setString(5, "SUPER_ADMIN")
-                ps.setString(6, "[]")
-                ps.setInt(7, 1)
-                ps.setLong(8, System.currentTimeMillis())
+                ps.setString(2, DEFAULT_TENANT)
+                ps.setString(3, username)
+                ps.setString(4, hashPassword(password))
+                ps.setString(5, "超级管理员")
+                ps.setString(6, "SUPER_ADMIN")
+                ps.setString(7, "[]")
+                ps.setInt(8, 1)
+                ps.setLong(9, System.currentTimeMillis())
                 ps.executeUpdate()
             }
         }
@@ -1573,13 +1723,17 @@ object Db {
         tools.forEach { t ->
             c.prepareStatement(
                 """
-                INSERT OR REPLACE INTO tools VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT OR REPLACE INTO tools(
+                    id, tenant_id, toolNumber, toolType, name, material, nominalDiameterMm, lengthMm,
+                    maxRpm, maxFeedMmPerMin, wearStatus, usageCount, notes
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """.trimIndent()
             ).use { ps ->
-                ps.setString(1, t.id); ps.setInt(2, t.toolNumber); ps.setString(3, t.toolType)
-                ps.setString(4, t.name); ps.setString(5, t.material); ps.setDouble(6, t.nominalDiameterMm)
-                ps.setDouble(7, t.lengthMm); ps.setInt(8, t.maxRpm); ps.setDouble(9, t.maxFeedMmPerMin)
-                ps.setString(10, t.wearStatus); ps.setInt(11, t.usageCount); ps.setString(12, t.notes)
+                ps.setString(1, t.id); ps.setString(2, DEFAULT_TENANT); ps.setInt(3, t.toolNumber)
+                ps.setString(4, t.toolType); ps.setString(5, t.name); ps.setString(6, t.material)
+                ps.setDouble(7, t.nominalDiameterMm); ps.setDouble(8, t.lengthMm); ps.setInt(9, t.maxRpm)
+                ps.setDouble(10, t.maxFeedMmPerMin); ps.setString(11, t.wearStatus); ps.setInt(12, t.usageCount)
+                ps.setString(13, t.notes)
                 ps.executeUpdate()
             }
         }
@@ -1593,12 +1747,19 @@ object Db {
             MaterialConfig("srv-m4", "6061 铝合金", "GB/T 3191", 2.7, "HB95", 400.0, 0.3, 5.0, false)
         )
         materials.forEach { m ->
-            c.prepareStatement("INSERT OR REPLACE INTO materials VALUES(?,?,?,?,?,?,?,?,?,?)").use { ps ->
-                ps.setString(1, m.id); ps.setString(2, m.name); ps.setString(3, m.code)
-                ps.setDouble(4, m.density); ps.setString(5, m.hardness)
-                ps.setDouble(6, m.recommendedCuttingSpeedMs); ps.setDouble(7, m.recommendedFeedPerRev)
-                ps.setDouble(8, m.recommendedDepthMm); ps.setInt(9, if (m.enabled) 1 else 0)
-                ps.setString(10, m.notes)
+            c.prepareStatement(
+                """
+                INSERT OR REPLACE INTO materials(
+                    id, tenant_id, name, code, density, hardness, recommendedCuttingSpeedMs,
+                    recommendedFeedPerRev, recommendedDepthMm, enabled, notes
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """.trimIndent()
+            ).use { ps ->
+                ps.setString(1, m.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, m.name)
+                ps.setString(4, m.code); ps.setDouble(5, m.density); ps.setString(6, m.hardness)
+                ps.setDouble(7, m.recommendedCuttingSpeedMs); ps.setDouble(8, m.recommendedFeedPerRev)
+                ps.setDouble(9, m.recommendedDepthMm); ps.setInt(10, if (m.enabled) 1 else 0)
+                ps.setString(11, m.notes)
                 ps.executeUpdate()
             }
         }
@@ -1611,9 +1772,9 @@ object Db {
             PartConfig("srv-p3", "轴承套", "srv-m3", "批量生产")
         )
         parts.forEach { p ->
-            c.prepareStatement("INSERT OR REPLACE INTO parts VALUES(?,?,?,?)").use { ps ->
-                ps.setString(1, p.id); ps.setString(2, p.name)
-                ps.setString(3, p.materialId); ps.setString(4, p.notes)
+            c.prepareStatement("INSERT OR REPLACE INTO parts(id, tenant_id, name, materialId, notes) VALUES(?,?,?,?,?)").use { ps ->
+                ps.setString(1, p.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, p.name)
+                ps.setString(4, p.materialId); ps.setString(5, p.notes)
                 ps.executeUpdate()
             }
         }
@@ -1622,9 +1783,12 @@ object Db {
             BlankConfig("srv-b2", "srv-p2", 40.0, 80.0, "srv-m2", "COLLET")
         )
         blanks.forEach { b ->
-            c.prepareStatement("INSERT OR REPLACE INTO blanks VALUES(?,?,?,?,?,?)").use { ps ->
-                ps.setString(1, b.id); ps.setString(2, b.partId); ps.setDouble(3, b.diameterMm)
-                ps.setDouble(4, b.lengthMm); ps.setString(5, b.materialId); ps.setString(6, b.clampType)
+            c.prepareStatement(
+                "INSERT OR REPLACE INTO blanks(id, tenant_id, partId, diameterMm, lengthMm, materialId, clampType) VALUES(?,?,?,?,?,?,?)"
+            ).use { ps ->
+                ps.setString(1, b.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, b.partId)
+                ps.setDouble(4, b.diameterMm); ps.setDouble(5, b.lengthMm); ps.setString(6, b.materialId)
+                ps.setString(7, b.clampType)
                 ps.executeUpdate()
             }
         }
@@ -1652,30 +1816,30 @@ object Db {
         )
         plans.forEach { p ->
             c.prepareStatement(
-                "INSERT OR REPLACE INTO process_plans VALUES(?,?,?,?,?,?)"
+                "INSERT OR REPLACE INTO process_plans(id, tenant_id, name, partId, stockDiameterMm, stockLengthMm, description) VALUES(?,?,?,?,?,?,?)"
             ).use { ps ->
-                ps.setString(1, p.id); ps.setString(2, p.name); ps.setString(3, p.partId)
-                ps.setDouble(4, p.stockDiameterMm); ps.setDouble(5, p.stockLengthMm)
-                ps.setString(6, p.description)
+                ps.setString(1, p.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, p.name)
+                ps.setString(4, p.partId); ps.setDouble(5, p.stockDiameterMm); ps.setDouble(6, p.stockLengthMm)
+                ps.setString(7, p.description)
                 ps.executeUpdate()
             }
             p.steps.forEach { s ->
                 c.prepareStatement(
                     """
                     INSERT OR REPLACE INTO process_steps(
-                        id, planId, orderIndex, type, toolId, cuttingSpeedMmPerMin, spindleRpm,
+                        id, tenant_id, planId, orderIndex, type, toolId, cuttingSpeedMmPerMin, spindleRpm,
                         feedMmPerRev, depthOfCutMm, finishAllowanceMm, approachDistanceMm,
                         retractDistanceMm, safetyDistanceMm, enabled, notes
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """.trimIndent()
                 ).use { ps ->
-                    ps.setString(1, s.id); ps.setString(2, s.planId); ps.setInt(3, s.orderIndex)
-                    ps.setString(4, s.type); ps.setString(5, s.toolId)
-                    ps.setDouble(6, s.cuttingSpeedMmPerMin); ps.setInt(7, s.spindleRpm)
-                    ps.setDouble(8, s.feedMmPerRev); ps.setDouble(9, s.depthOfCutMm)
-                    ps.setDouble(10, s.finishAllowanceMm); ps.setDouble(11, s.approachDistanceMm)
-                    ps.setDouble(12, s.retractDistanceMm); ps.setDouble(13, s.safetyDistanceMm)
-                    ps.setInt(14, if (s.enabled) 1 else 0); ps.setString(15, s.notes)
+                    ps.setString(1, s.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, s.planId)
+                    ps.setInt(4, s.orderIndex); ps.setString(5, s.type); ps.setString(6, s.toolId)
+                    ps.setDouble(7, s.cuttingSpeedMmPerMin); ps.setInt(8, s.spindleRpm)
+                    ps.setDouble(9, s.feedMmPerRev); ps.setDouble(10, s.depthOfCutMm)
+                    ps.setDouble(11, s.finishAllowanceMm); ps.setDouble(12, s.approachDistanceMm)
+                    ps.setDouble(13, s.retractDistanceMm); ps.setDouble(14, s.safetyDistanceMm)
+                    ps.setInt(15, if (s.enabled) 1 else 0); ps.setString(16, s.notes)
                     ps.executeUpdate()
                 }
             }
@@ -1722,18 +1886,19 @@ object Db {
             DrawingConfig("srv-d2", "液压阀芯.dxf", 1, 4, "SERVER", dxf)
         )
         drawings.forEach { d ->
-            c.prepareStatement("INSERT OR REPLACE INTO drawings VALUES(?,?,?,?,?,?)").use { ps ->
-                ps.setString(1, d.id); ps.setString(2, d.filename); ps.setInt(3, d.layers)
-                ps.setInt(4, d.entities); ps.setString(5, d.source); ps.setString(6, d.dxfContent)
+            c.prepareStatement("INSERT OR REPLACE INTO drawings(id, tenant_id, filename, layers, entities, source, dxfContent) VALUES(?,?,?,?,?,?,?)").use { ps ->
+                ps.setString(1, d.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, d.filename)
+                ps.setInt(4, d.layers); ps.setInt(5, d.entities); ps.setString(6, d.source)
+                ps.setString(7, d.dxfContent)
                 ps.executeUpdate()
             }
         }
         c.prepareStatement(
-            "INSERT OR REPLACE INTO drawing_corrections VALUES(?,?,?,?,?,?,?,?)"
+            "INSERT OR REPLACE INTO drawing_corrections(drawingId, tenant_id, scale, offsetX, offsetY, rotationDeg, mirrorX, mirrorY, unit) VALUES(?,?,?,?,?,?,?,?,?)"
         ).use { ps ->
-            ps.setString(1, "srv-d1"); ps.setDouble(2, 1.0); ps.setDouble(3, 0.0)
-            ps.setDouble(4, 0.0); ps.setDouble(5, 0.0); ps.setInt(6, 0); ps.setInt(7, 0)
-            ps.setString(8, "MM")
+            ps.setString(1, "srv-d1"); ps.setString(2, DEFAULT_TENANT); ps.setDouble(3, 1.0)
+            ps.setDouble(4, 0.0); ps.setDouble(5, 0.0); ps.setDouble(6, 0.0); ps.setInt(7, 0)
+            ps.setInt(8, 0); ps.setString(9, "MM")
             ps.executeUpdate()
         }
     }
@@ -1745,10 +1910,12 @@ object Db {
             TaskRecord("srv-h2", "液压阀芯", "srv-pp2", "FAILED", 120.3, "操作员B", now - 172_800_000, now - 172_679_700)
         )
         tasks.forEach { t ->
-            c.prepareStatement("INSERT OR REPLACE INTO task_history VALUES(?,?,?,?,?,?,?,?)").use { ps ->
-                ps.setString(1, t.id); ps.setString(2, t.partName); ps.setString(3, t.planId)
-                ps.setString(4, t.status); ps.setDouble(5, t.durationSec); ps.setString(6, t.operator)
-                ps.setLong(7, t.startedAt); ps.setLong(8, t.finishedAt)
+            c.prepareStatement(
+                "INSERT OR REPLACE INTO task_history(id, tenant_id, partName, planId, status, durationSec, operator, startedAt, finishedAt) VALUES(?,?,?,?,?,?,?,?,?)"
+            ).use { ps ->
+                ps.setString(1, t.id); ps.setString(2, DEFAULT_TENANT); ps.setString(3, t.partName)
+                ps.setString(4, t.planId); ps.setString(5, t.status); ps.setDouble(6, t.durationSec)
+                ps.setString(7, t.operator); ps.setLong(8, t.startedAt); ps.setLong(9, t.finishedAt)
                 ps.executeUpdate()
             }
         }
@@ -1757,19 +1924,20 @@ object Db {
     // ===== 操作日志 =====
 
     /** 批量插入设备上传的操作日志。 */
-    fun insertLogs(deviceId: String, logs: List<OperationLogDto>) = withConn { c ->
+    fun insertLogs(deviceId: String, logs: List<OperationLogDto>, tenantId: String = DEFAULT_TENANT) = withConn { c ->
         if (logs.isEmpty()) return@withConn
         c.prepareStatement(
-            "INSERT INTO operation_logs(device_id, timestamp, level, category, message, task_id, details) VALUES(?,?,?,?,?,?,?)"
+            "INSERT INTO operation_logs(tenant_id, device_id, timestamp, level, category, message, task_id, details) VALUES(?,?,?,?,?,?,?,?)"
         ).use { ps ->
             logs.forEach { log ->
-                ps.setString(1, deviceId)
-                ps.setLong(2, log.timestamp)
-                ps.setString(3, log.level)
-                ps.setString(4, log.category)
-                ps.setString(5, log.message)
-                if (log.taskId != null) ps.setString(6, log.taskId) else ps.setNull(6, java.sql.Types.VARCHAR)
-                if (log.details != null) ps.setString(7, log.details) else ps.setNull(7, java.sql.Types.VARCHAR)
+                ps.setString(1, tenantId)
+                ps.setString(2, deviceId)
+                ps.setLong(3, log.timestamp)
+                ps.setString(4, log.level)
+                ps.setString(5, log.category)
+                ps.setString(6, log.message)
+                if (log.taskId != null) ps.setString(7, log.taskId) else ps.setNull(7, java.sql.Types.VARCHAR)
+                if (log.details != null) ps.setString(8, log.details) else ps.setNull(8, java.sql.Types.VARCHAR)
                 ps.addBatch()
             }
             ps.executeBatch()
@@ -1777,15 +1945,16 @@ object Db {
     }
 
     /** 查询操作日志；可选按 deviceId 过滤，按 timestamp DESC 返回。 */
-    fun listLogs(deviceId: String? = null, limit: Int = 500): List<OperationLogDto> = withConn { c ->
+    fun listLogs(deviceId: String? = null, limit: Int = 500, tenantId: String = DEFAULT_TENANT): List<OperationLogDto> = withConn { c ->
         val sql = if (deviceId.isNullOrBlank()) {
-            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs ORDER BY timestamp DESC LIMIT ?"
+            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? ORDER BY timestamp DESC LIMIT ?"
         } else {
-            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE device_id = ? ORDER BY timestamp DESC LIMIT ?"
+            "SELECT timestamp, level, category, message, task_id, details FROM operation_logs WHERE tenant_id = ? AND device_id = ? ORDER BY timestamp DESC LIMIT ?"
         }
         c.prepareStatement(sql).use { ps ->
-            if (!deviceId.isNullOrBlank()) ps.setString(1, deviceId)
-            ps.setInt(if (deviceId.isNullOrBlank()) 1 else 2, limit)
+            ps.setString(1, tenantId)
+            if (!deviceId.isNullOrBlank()) ps.setString(2, deviceId)
+            ps.setInt(if (deviceId.isNullOrBlank()) 2 else 3, limit)
             ps.executeQuery().use { rs ->
                 buildList {
                     while (rs.next()) {
@@ -1806,15 +1975,16 @@ object Db {
     }
 
     /** 清理指定设备（或全部）早于 olderThanMs 的日志，返回删除行数。 */
-    fun deleteLogsOlderThan(deviceId: String?, olderThanMs: Long): Int = withConn { c ->
+    fun deleteLogsOlderThan(deviceId: String?, olderThanMs: Long, tenantId: String = DEFAULT_TENANT): Int = withConn { c ->
         val sql = if (deviceId.isNullOrBlank()) {
-            "DELETE FROM operation_logs WHERE timestamp < ?"
+            "DELETE FROM operation_logs WHERE tenant_id = ? AND timestamp < ?"
         } else {
-            "DELETE FROM operation_logs WHERE device_id = ? AND timestamp < ?"
+            "DELETE FROM operation_logs WHERE tenant_id = ? AND device_id = ? AND timestamp < ?"
         }
         c.prepareStatement(sql).use { ps ->
-            if (!deviceId.isNullOrBlank()) ps.setString(1, deviceId)
-            ps.setLong(if (deviceId.isNullOrBlank()) 1 else 2, olderThanMs)
+            ps.setString(1, tenantId)
+            if (!deviceId.isNullOrBlank()) ps.setString(2, deviceId)
+            ps.setLong(if (deviceId.isNullOrBlank()) 2 else 3, olderThanMs)
             ps.executeUpdate()
         }
     }

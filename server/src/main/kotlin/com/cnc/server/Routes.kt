@@ -68,6 +68,9 @@ private fun sha256Of(file: File): String {
 private fun ApplicationCall.bearerToken(): String =
     request.headers[HttpHeaders.Authorization].orEmpty().removePrefix("Bearer").trim()
 
+/** 租户上下文（ADR-0002）：取请求头 X-Tenant-Id，缺省回退默认租户。 */
+private fun ApplicationCall.tenantId(): String = Db.normalizeTenant(request.headers["X-Tenant-Id"])
+
 /** 管理端操作者：环境变量口令 / 设备令牌视为超管虚拟账号。 */
 private data class AdminActor(
     val id: String,
@@ -139,6 +142,7 @@ fun Application.cncServerModule(adminToken: String) {
         allowHeader("Authorization")
         allowHeader("Content-Type")
         allowHeader("X-Auth-Token")
+        allowHeader("X-Tenant-Id")
     }
     install(WebSockets)
     install(StatusPages) {
@@ -219,10 +223,11 @@ fun Application.cncServerModule(adminToken: String) {
                     return@post
                 }
                 val req = call.receive<AdminLoginRequest>()
-                if (Db.verifyAdminAccount(req.username, req.password)) {
+                val tenant = call.tenantId()
+                if (Db.verifyAdminAccount(req.username, req.password, tenant)) {
                     // users 表中存在该账号时带出角色/权限；老库回退登录时按超管处理
-                    val account = Db.findUserByUsername(req.username)
-                    val token = Db.createSession(req.username, account?.id ?: "")
+                    val account = Db.findUserByUsername(req.username, tenant)
+                    val token = Db.createSession(req.username, account?.id ?: "", tenant)
                     call.respond(
                         AdminLoginResult(
                             ok = true,
@@ -254,7 +259,7 @@ fun Application.cncServerModule(adminToken: String) {
                 // 设备激活：按 hardwareId 幂等（同一硬件重复激活 = 同一台设备）。
                 // 客户端「清除数据」后本地令牌会丢失，若拒绝激活将永久卡死，
                 // 因此这里不再返回 409，由数据层更新原记录并保留原令牌。
-                val info = Db.registerDevice(req)
+                val info = Db.registerDevice(req, call.tenantId())
                 call.respond(info)
             }
             post("/devices/{id}/heartbeat") {
@@ -267,7 +272,7 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 val id = call.parameters["id"].orEmpty()
                 val req = runCatching { call.receive<HeartbeatRequest>() }.getOrDefault(HeartbeatRequest())
-                val info = Db.heartbeat(id, req.appVersion)
+                val info = Db.heartbeat(id, req.appVersion, call.tenantId())
                 if (info != null) call.respond(info)
                 else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在或已注销"))
             }
@@ -289,7 +294,7 @@ fun Application.cncServerModule(adminToken: String) {
             }
             post("/devices/{id}/verify-admin") {
                 val id = call.parameters["id"].orEmpty()
-                if (Db.getDevice(id) == null) {
+                if (Db.getDevice(id, call.tenantId()) == null) {
                     call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
                     return@post
                 }
@@ -303,8 +308,14 @@ fun Application.cncServerModule(adminToken: String) {
         authenticate("device") {
             route("/api/v1") {
                 post("/logs") {
+                    // 设备令牌绑定租户：令牌租户与请求头不一致时拒绝，防止跨租户写入
+                    val tokenTenant = Db.tenantIdOfDeviceToken(call.bearerToken())
+                    if (tokenTenant != null && tokenTenant != call.tenantId()) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
+                        return@post
+                    }
                     val req = call.receive<UploadLogsRequest>()
-                    Db.insertLogs(req.deviceId, req.logs)
+                    Db.insertLogs(req.deviceId, req.logs, call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "已接收 ${req.logs.size} 条日志"))
                 }
             }
@@ -317,6 +328,13 @@ fun Application.cncServerModule(adminToken: String) {
                     val token = call.bearerToken()
                     if (token == adminToken) return@intercept
                     if (Db.isValidDeviceToken(token)) {
+                        // 设备令牌绑定租户：请求头租户与令牌所属租户不一致时拒绝
+                        val tokenTenant = Db.tenantIdOfDeviceToken(token)
+                        if (tokenTenant != null && tokenTenant != call.tenantId()) {
+                            call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
+                            finish()
+                            return@intercept
+                        }
                         // R6 收紧：设备令牌白名单——仅允许读配置/自检/查本机 + 回传任务记录/实时状态，
                         // 其余一律 403（含 /logs、/users、设备列表、写配置等）
                         val m = call.request.httpMethod.value
@@ -337,6 +355,12 @@ fun Application.cncServerModule(adminToken: String) {
                     val user = Db.getSessionUser(token)
                     if (user == null) {
                         call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
+                        finish()
+                        return@intercept
+                    }
+                    // 会话绑定租户：请求头租户与会话所属租户不一致时拒绝（ADR-0002）
+                    if (user.tenantId != call.tenantId()) {
+                        call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "租户上下文不匹配"))
                         finish()
                         return@intercept
                     }
@@ -383,7 +407,7 @@ fun Application.cncServerModule(adminToken: String) {
 
                 // ===== 用户管理 =====
                 get("/users") {
-                    call.respond(Db.listUsers())
+                    call.respond(Db.listUsers(call.tenantId()))
                 }
 
                 post("/users") {
@@ -407,7 +431,7 @@ fun Application.cncServerModule(adminToken: String) {
                         return@post
                     }
                     val result = runCatching {
-                        Db.createUser(body.username.trim(), body.password, body.displayName, body.role, body.permissions)
+                        Db.createUser(body.username.trim(), body.password, body.displayName, body.role, body.permissions, tenantId = call.tenantId())
                     }
                     val error = result.exceptionOrNull()
                     if (error is IllegalArgumentException) {
@@ -434,7 +458,7 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
                         return@put
                     }
-                    if (!Db.changeOwnPassword(user.id, body.oldPassword, body.newPassword)) {
+                    if (!Db.changeOwnPassword(user.id, body.oldPassword, body.newPassword, user.tenantId)) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "原密码错误"))
                         return@put
                     }
@@ -446,7 +470,7 @@ fun Application.cncServerModule(adminToken: String) {
                     val id = call.parameters["id"].orEmpty()
                     val actor = adminActorOf(call, adminToken)
                         ?: return@put call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
-                    val target = Db.findUserById(id)
+                    val target = Db.findUserById(id, call.tenantId())
                     if (target == null) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
                         return@put
@@ -468,7 +492,7 @@ fun Application.cncServerModule(adminToken: String) {
                     }
                     if (target.role == ROLE_SUPER_ADMIN &&
                         (newRole != ROLE_SUPER_ADMIN || body.enabled == false) &&
-                        Db.countSuperAdmins() <= 1
+                        Db.countSuperAdmins(call.tenantId()) <= 1
                     ) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
                         return@put
@@ -478,7 +502,8 @@ fun Application.cncServerModule(adminToken: String) {
                         displayName = body.displayName?.ifBlank { target.displayName } ?: target.displayName,
                         role = newRole,
                         permissions = body.permissions ?: target.permissions,
-                        enabled = body.enabled ?: target.enabled
+                        enabled = body.enabled ?: target.enabled,
+                        tenantId = call.tenantId()
                     )
                     if (updated == null) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
@@ -491,7 +516,7 @@ fun Application.cncServerModule(adminToken: String) {
                     val id = call.parameters["id"].orEmpty()
                     val actor = adminActorOf(call, adminToken)
                         ?: return@delete call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
-                    val target = Db.findUserById(id)
+                    val target = Db.findUserById(id, call.tenantId())
                     if (target == null) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
                         return@delete
@@ -504,11 +529,11 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.Forbidden, SimpleResult(ok = false, message = "无权限执行该操作"))
                         return@delete
                     }
-                    if (target.role == ROLE_SUPER_ADMIN && Db.countSuperAdmins() <= 1) {
+                    if (target.role == ROLE_SUPER_ADMIN && Db.countSuperAdmins(call.tenantId()) <= 1) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "系统至少保留一个超级管理员"))
                         return@delete
                     }
-                    if (!Db.deleteUser(id)) {
+                    if (!Db.deleteUser(id, call.tenantId())) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
                     } else {
                         call.respond(SimpleResult(ok = true, message = "用户已删除"))
@@ -519,7 +544,7 @@ fun Application.cncServerModule(adminToken: String) {
                     val id = call.parameters["id"].orEmpty()
                     val actor = adminActorOf(call, adminToken)
                         ?: return@post call.respond(HttpStatusCode.Unauthorized, SimpleResult(ok = false, message = "登录已失效"))
-                    val target = Db.findUserById(id)
+                    val target = Db.findUserById(id, call.tenantId())
                     if (target == null) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
                         return@post
@@ -533,7 +558,7 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "密码长度至少 6 位"))
                         return@post
                     }
-                    if (!Db.resetUserPassword(id, body.newPassword)) {
+                    if (!Db.resetUserPassword(id, body.newPassword, call.tenantId())) {
                         call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "用户不存在"))
                         return@post
                     }
@@ -554,7 +579,7 @@ fun Application.cncServerModule(adminToken: String) {
                 }
 
                 get("/config") {
-                    call.respond(Db.snapshot())
+                    call.respond(Db.snapshot(call.tenantId()))
                 }
 
                 get("/config/version") {
@@ -569,79 +594,79 @@ fun Application.cncServerModule(adminToken: String) {
 
                 // ===== 刀具 =====
                 post("/tools") {
-                    val saved = Db.upsertTool(call.receive<ToolConfig>())
+                    val saved = Db.upsertTool(call.receive<ToolConfig>(), call.tenantId())
                     call.respond(saved)
                 }
                 delete("/tools/{id}") {
-                    Db.deleteTool(call.parameters["id"].orEmpty())
+                    Db.deleteTool(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "刀具已删除"))
                 }
 
                 // ===== 材料 =====
                 post("/materials") {
-                    call.respond(Db.upsertMaterial(call.receive<MaterialConfig>()))
+                    call.respond(Db.upsertMaterial(call.receive<MaterialConfig>(), call.tenantId()))
                 }
                 delete("/materials/{id}") {
-                    Db.deleteMaterial(call.parameters["id"].orEmpty())
+                    Db.deleteMaterial(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "材料已删除"))
                 }
 
                 // ===== 零件 / 毛坯 =====
                 post("/parts") {
-                    call.respond(Db.upsertPart(call.receive<PartConfig>()))
+                    call.respond(Db.upsertPart(call.receive<PartConfig>(), call.tenantId()))
                 }
                 delete("/parts/{id}") {
-                    Db.deletePart(call.parameters["id"].orEmpty())
+                    Db.deletePart(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "零件已删除"))
                 }
                 post("/blanks") {
-                    call.respond(Db.upsertBlank(call.receive<BlankConfig>()))
+                    call.respond(Db.upsertBlank(call.receive<BlankConfig>(), call.tenantId()))
                 }
                 delete("/blanks/{id}") {
-                    Db.deleteBlank(call.parameters["id"].orEmpty())
+                    Db.deleteBlank(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "毛坯已删除"))
                 }
 
                 // ===== 工艺方案 =====
                 post("/plans") {
-                    call.respond(Db.upsertPlan(call.receive<ProcessPlanConfig>()))
+                    call.respond(Db.upsertPlan(call.receive<ProcessPlanConfig>(), call.tenantId()))
                 }
                 delete("/plans/{id}") {
-                    Db.deletePlan(call.parameters["id"].orEmpty())
+                    Db.deletePlan(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "工艺方案已删除"))
                 }
 
                 // ===== 图纸 =====
                 post("/drawings") {
-                    call.respond(Db.upsertDrawing(call.receive<DrawingConfig>()))
+                    call.respond(Db.upsertDrawing(call.receive<DrawingConfig>(), call.tenantId()))
                 }
                 delete("/drawings/{id}") {
-                    Db.deleteDrawing(call.parameters["id"].orEmpty())
+                    Db.deleteDrawing(call.parameters["id"].orEmpty(), call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "图纸已删除"))
                 }
                 post("/corrections") {
-                    call.respond(Db.upsertCorrection(call.receive<DrawingCorrectionConfig>()))
+                    call.respond(Db.upsertCorrection(call.receive<DrawingCorrectionConfig>(), call.tenantId()))
                 }
 
                 // ===== 任务记录 =====
                 get("/tasks") {
-                    call.respond(Db.tasks())
+                    call.respond(Db.tasks(tenantId = call.tenantId()))
                 }
                 post("/tasks") {
-                    call.respond(Db.upsertTask(call.receive<TaskRecord>()))
+                    call.respond(Db.upsertTask(call.receive<TaskRecord>(), call.tenantId()))
                 }
 
                 // ===== 操作日志（管理端查询/清理）=====
                 get("/logs") {
                     val deviceId = call.request.queryParameters["deviceId"]
                     val limit = call.request.queryParameters["limit"]?.toIntOrNull() ?: 500
-                    call.respond(Db.listLogs(deviceId, limit))
+                    call.respond(Db.listLogs(deviceId, limit, call.tenantId()))
                 }
                 delete("/logs") {
                     val deviceId = call.request.queryParameters["deviceId"]
                     val olderThanMs = call.request.queryParameters["olderThanMs"]?.toLongOrNull()
                         ?: (System.currentTimeMillis() - 7L * 24 * 3600 * 1000)
-                    val deleted = Db.deleteLogsOlderThan(deviceId, olderThanMs)
+                    val deleted = Db.deleteLogsOlderThan(deviceId, olderThanMs, call.tenantId())
                     call.respond(SimpleResult(ok = true, message = "已清理 $deleted 条日志"))
                 }
 
@@ -651,7 +676,7 @@ fun Application.cncServerModule(adminToken: String) {
                 }
                 post("/status") {
                     val status = call.receive<DeviceStatus>()
-                    Db.saveStatus(status)
+                    Db.saveStatus(status, call.tenantId())
                     StatusHub.broadcast(json.encodeToString(DeviceStatus.serializer(), status))
                     call.respond(SimpleResult(ok = true, message = "status accepted"))
                 }
@@ -659,10 +684,10 @@ fun Application.cncServerModule(adminToken: String) {
                 // ===== 设备管理（后台）=====
                 // 注意：必须注册在 /devices/{id} 之前，避免 org-summary 被当作设备 id
                 get("/devices/org-summary") {
-                    call.respond(Db.orgSummary())
+                    call.respond(Db.orgSummary(call.tenantId()))
                 }
                 get("/devices") {
-                    call.respond(Db.listDevices())
+                    call.respond(Db.listDevices(call.tenantId()))
                 }
                 // 设备详情：R2 修复——需鉴权；设备令牌仅可查自身；响应剥离 token
                 //（token 仅在注册/心跳响应中下发，避免经此接口泄露）
@@ -681,7 +706,7 @@ fun Application.cncServerModule(adminToken: String) {
                             return@get
                         }
                     }
-                    val info = Db.getDevice(id)
+                    val info = Db.getDevice(id, call.tenantId())
                     if (info != null) call.respond(info.copy(token = ""))
                     else call.respond(HttpStatusCode.NotFound, SimpleResult(ok = false, message = "设备不存在"))
                 }
@@ -692,18 +717,18 @@ fun Application.cncServerModule(adminToken: String) {
                         call.respond(HttpStatusCode.BadRequest, SimpleResult(ok = false, message = "单位、联系人、电话不能为空"))
                         return@put
                     }
-                    val ok = Db.updateDeviceInfo(id, body)
+                    val ok = Db.updateDeviceInfo(id, body, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "设备信息已更新" else "设备不存在"))
                 }
                 delete("/devices/{id}") {
                     val id = call.parameters["id"].orEmpty()
-                    val ok = Db.deleteDevice(id)
+                    val ok = Db.deleteDevice(id, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "设备已注销，可重新注册" else "设备不存在"))
                 }
                 put("/devices/{id}/permissions") {
                     val id = call.parameters["id"].orEmpty()
                     val body = call.receive<DevicePermissionsUpdate>()
-                    val ok = Db.updateDevicePermissions(id, body.permissions)
+                    val ok = Db.updateDevicePermissions(id, body.permissions, call.tenantId())
                     call.respond(SimpleResult(ok = ok, message = if (ok) "权限已更新" else "设备不存在"))
                 }
 
