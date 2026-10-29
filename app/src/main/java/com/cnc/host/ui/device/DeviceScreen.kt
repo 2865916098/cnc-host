@@ -24,12 +24,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.cnc.host.sync.DeviceConfigDto
+import com.cnc.host.sync.ServerPrefs
 import com.cnc.ui.theme.CncColors
 import com.cnc.ui.theme.CncTypography
+import com.google.gson.Gson
 
 /** 控制卡配置页面。 */
 @Composable
@@ -39,6 +43,9 @@ fun DeviceScreen(modifier: Modifier = Modifier, vm: DeviceViewModel = viewModel(
 
     Column(modifier.fillMaxSize().background(CncColors.Background).padding(16.dp)) {
         Text("控制卡配置", style = CncTypography.headlineMedium, color = CncColors.TextPrimary)
+        Spacer(Modifier.height(12.dp))
+
+        ServerDriverCard()
         Spacer(Modifier.height(12.dp))
 
         Column(
@@ -82,6 +89,46 @@ fun DeviceScreen(modifier: Modifier = Modifier, vm: DeviceViewModel = viewModel(
                 Button(onClick = { vm.save() }, modifier = Modifier) { Text("保存配置") }
                 if (saved) Text("✓ 已保存（内存态，重启后丢失）", style = CncTypography.bodySmall, color = Color(0xFF4CAF50))
             }
+        }
+    }
+}
+
+/**
+ * 服务端下发的驱动配置（只读）。
+ *
+ * 驱动类型与连接参数由服务端后台统一下发；本页上方表单仅为本地演示用，
+ * 真实生效以最近一次服务端同步为准。
+ */
+@Composable
+private fun ServerDriverCard() {
+    val context = LocalContext.current
+    val dto = remember {
+        ServerPrefs.deviceJson(context)
+            ?.let { runCatching { Gson().fromJson(it, DeviceConfigDto::class.java) }.getOrNull() }
+    } ?: return
+
+    Column(
+        Modifier.fillMaxWidth().background(CncColors.Surface, RoundedCornerShape(8.dp))
+            .border(1.dp, CncColors.Border, RoundedCornerShape(8.dp)).padding(16.dp)
+    ) {
+        Text(
+            "服务端下发驱动配置（生效以服务端为准）",
+            style = CncTypography.titleMedium, fontWeight = FontWeight.Bold, color = CncColors.TextPrimary
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "驱动类型：${dto.comm.driverType}　协议：${dto.comm.protocol}　模式：${if (dto.useSimulator) "模拟器" else "真实控制卡"}",
+            style = CncTypography.bodySmall, color = CncColors.TextPrimary
+        )
+        Text(
+            "地址：${dto.comm.ipAddress}:${dto.comm.port}　站号：${dto.comm.deviceId}　超时：${dto.comm.timeoutMs}ms",
+            style = CncTypography.bodySmall, color = CncColors.TextPrimary
+        )
+        if (dto.comm.params.isNotEmpty()) {
+            Text(
+                "扩展参数：" + dto.comm.params.entries.joinToString("　") { "${it.key}=${it.value}" },
+                style = CncTypography.bodySmall, color = CncColors.TextSecondary
+            )
         }
     }
 }

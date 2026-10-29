@@ -332,8 +332,10 @@
         </div>
       </div>
       <div class="panel">
-        <h3>通讯参数</h3>
+        <h3>驱动与通讯参数</h3>
         <div class="form-row">
+          <div class="field"><label>驱动类型</label><select id="comm_driver">${optionList(
+            [{v:"SIMULATOR",t:"SIMULATOR（内置模拟器）"},{v:"MODBUS_TCP",t:"MODBUS_TCP（通用网口控制卡）"}].map((x) => ({ v: x.v, t: x.t })), "v", (x) => x.t, comm.driverType || "SIMULATOR")}</select></div>
           <div class="field"><label>协议</label><select id="comm_proto">${optionList(
             ["MODBUS_TCP", "MODBUS_RTU", "SERIAL_TCP"].map((v) => ({ v })), "v", (x) => x.v.replace(/_/g, " "), comm.protocol)}</select></div>
           <div class="field"><label>设备站号</label><input id="comm_dev" type="number" value="${esc(comm.deviceId)}"></div>
@@ -348,11 +350,29 @@
           <div class="field"><label>波特率</label><select id="comm_baud">${optionList(
             [9600, 19200, 38400, 57600, 115200].map((v) => ({ v })), "v", (x) => String(x.v), comm.baudRate)}</select></div>
         </div>
+        <div class="form-row" style="margin-top:12px">
+          <div class="field"><label>驱动扩展参数（JSON，寄存器映射等；留空用默认布局）</label>
+            <textarea id="comm_params" rows="4" placeholder='{"pos_scale":"100","status_word_addr":"6"}' style="width:100%">${esc(JSON.stringify(comm.params || {}))}</textarea>
+            <div class="hint">换控制卡只需调整此处映射，客户端无需升级；非法 JSON 保存时会被拒绝。</div>
+          </div>
+        </div>
       </div>`;
   }
 
   window.saveDevice = async function () {
     const c = S.config;
+    let params = {};
+    const rawParams = ($("comm_params").value || "").trim();
+    if (rawParams) {
+      try {
+        const parsed = JSON.parse(rawParams);
+        if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("参数必须是 JSON 对象");
+        for (const k of Object.keys(parsed)) params[k] = String(parsed[k]);
+      } catch (e) {
+        toast("驱动扩展参数 JSON 非法：" + e.message, true);
+        return;
+      }
+    }
     const d = {
       name: $("dev_name").value.trim(),
       controlCard: $("dev_card").value,
@@ -368,7 +388,9 @@
         serialPort: $("comm_serial").value.trim(),
         baudRate: Number($("comm_baud").value),
         deviceId: Number($("comm_dev").value),
-        timeoutMs: Number($("comm_timeout").value)
+        timeoutMs: Number($("comm_timeout").value),
+        driverType: $("comm_driver").value,
+        params: params
       }
     };
     try {

@@ -861,6 +861,29 @@ curl -X PUT http://127.0.0.1:8080/api/v1/users/me/password \
 | baudRate | Int | `115200` | 波特率 |
 | deviceId | Int | `1` | Modbus 从站地址 |
 | timeoutMs | Long | `2000` | 超时（毫秒） |
+| driverType | String | `SIMULATOR` | 驱动类型：`SIMULATOR`（内置模拟器）/ `MODBUS_TCP`（通用网口控制卡）；客户端驱动注册表解析，未知类型安全回退模拟器 |
+| params | Map<String,String> | `{}` | 驱动扩展参数（寄存器映射等），客户端原样透传给驱动。`MODBUS_TCP` 驱动支持的键见下方说明 |
+
+`MODBUS_TCP` 驱动 `params` 支持的键（均为字符串；缺省用默认布局）：
+
+| 键 | 默认 | 含义 |
+| --- | --- | --- |
+| pos_x_addr / pos_z_addr | `0` / `2` | X/Z 实际位置寄存器地址 |
+| pos_scale | `100` | 寄存器值 ÷ scale = mm |
+| pos_32bit | `true` | 位置是否 32 位有符号（高字在前） |
+| spindle_rpm_addr | `4` | 主轴实际转速反馈寄存器 |
+| status_word_addr | `6` | 状态字：bit0=忙 bit1=完成 bit2=报警 bit3=急停 |
+| control_word_addr | `8` | 控制字：bit0=启动 bit1=暂停 bit2=停止 bit3=回零 |
+| cmd_type_addr | `16` | 命令类型：1=快速 2=直线 3=圆弧CW 4=圆弧CCW |
+| cmd_x_addr / cmd_z_addr | `10` / `12` | 命令目标 X/Z |
+| cmd_feed_addr | `14` | 命令进给（32 位，0.01 mm/min） |
+| cmd_cx_addr / cmd_cz_addr | `18` / `20` | 圆弧圆心 X/Z |
+| spindle_cmd_addr / spindle_on_addr | `22` / `23` | 主轴命令转速 / 启停（0=停 1=正转 2=反转） |
+| input_start / input_count | `0` / `16` | 离散输入区 |
+| output_start / output_count | `0` / `16` | 线圈输出区 |
+| alarm_start / alarm_count | `24` / `4` | 报警代码区（非零即报警） |
+| poll_interval_ms | `200` | 状态轮询间隔（下限 50） |
+| command_timeout_ms | `10000` | 运动命令完成位等待超时（下限 500） |
 
 ```json
 {

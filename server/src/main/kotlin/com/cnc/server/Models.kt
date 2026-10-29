@@ -17,7 +17,11 @@ data class CommConfig(
     val serialPort: String = "/dev/ttyUSB0",
     val baudRate: Int = 115200,
     val deviceId: Int = 1,
-    val timeoutMs: Long = 2000
+    val timeoutMs: Long = 2000,
+    /** 驱动类型：SIMULATOR（默认，内置模拟器）/ MODBUS_TCP（通用网口控制卡）等，由客户端驱动注册表解析。 */
+    val driverType: String = "SIMULATOR",
+    /** 驱动扩展参数（寄存器映射等），键值均由后台维护，客户端原样透传给驱动。 */
+    val params: Map<String, String> = emptyMap()
 )
 
 @Serializable
